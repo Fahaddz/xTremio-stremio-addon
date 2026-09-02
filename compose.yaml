@@ -14,6 +14,12 @@ services:
       PORT: 3000
       HOST: 0.0.0.0
 
+      # Large Xtream libraries can take longer than the default 15 seconds to
+      # download. Metadata keeps the shorter timeout; catalog lists get more
+      # time because an empty result is not useful to Stremio.
+      UPSTREAM_CATEGORY_TIMEOUT_MS: 30000
+      UPSTREAM_LIST_TIMEOUT_MS: 90000
+
       # Keep this low for a single-user/small deployment.
       # Increase only if you intentionally serve multiple accounts.
       CACHE_MAX_ACCOUNTS: 2
@@ -21,13 +27,14 @@ services:
 
     restart: unless-stopped
 
-    # 256 MiB gives Node enough headroom while keeping the container small.
-    # The app itself limits the V8 heap to 192 MiB.
+    # Catalog responses can be large before they are compacted and cached.
+    # Keep enough headroom for one large response without making the service
+    # needlessly large on small deployments.
     deploy:
       resources:
         limits:
-          cpus: "0.25"
-          memory: 256M
+          cpus: "0.50"
+          memory: 384M
         reservations:
           memory: 32M
 

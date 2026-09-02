@@ -45,6 +45,8 @@ For a direct Node.js deployment, run `npm ci --omit=dev && npm start`.
 |---|---:|---|
 | `CACHE_MAX_ACCOUNTS` | `2` | Maximum account snapshots retained in the main caches |
 | `CACHE_MAX_METADATA` | `128` | Maximum movie/series metadata entries retained |
+| `UPSTREAM_CATEGORY_TIMEOUT_MS` | `30000` | Maximum time for category API calls |
+| `UPSTREAM_LIST_TIMEOUT_MS` | `90000` | Maximum time for stream-list API calls |
 
 The caches use stale-while-revalidate. Complete responses can be served stale while
 one background refresh runs; incomplete category and metadata responses are not retained.

@@ -14,6 +14,8 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const ADDON_ID = 'org.xtremio.addon';
+const CATEGORY_TIMEOUT_MS = Math.max(15000, Number(process.env.UPSTREAM_CATEGORY_TIMEOUT_MS) || 30000);
+const LIST_TIMEOUT_MS = Math.max(30000, Number(process.env.UPSTREAM_LIST_TIMEOUT_MS) || 90000);
 
 function getBaseUrl(req) {
     const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
@@ -211,6 +213,11 @@ async function xtremioGet(cfg, action, extraParams = '', { timeoutMs = 15000 } =
         if (!res.ok) throw new Error(`xtremio ${action} failed: HTTP ${res.status}`);
         const data = await res.json();
         return data;
+    } catch (e) {
+        if (e.name === 'AbortError') {
+            throw new Error(`xtremio ${action} timed out after ${timeoutMs}ms`, { cause: e });
+        }
+        throw e;
     } finally {
         clearTimeout(timer);
     }
@@ -391,9 +398,9 @@ async function getCategories(cfg) {
     const key = accountCacheKey(cfg);
     return catCache.get(key, async () => {
         const results = await Promise.allSettled([
-            xtremioGet(cfg, 'get_live_categories'),
-            xtremioGet(cfg, 'get_vod_categories'),
-            xtremioGet(cfg, 'get_series_categories')
+            xtremioGet(cfg, 'get_live_categories', '', { timeoutMs: CATEGORY_TIMEOUT_MS }),
+            xtremioGet(cfg, 'get_vod_categories', '', { timeoutMs: CATEGORY_TIMEOUT_MS }),
+            xtremioGet(cfg, 'get_series_categories', '', { timeoutMs: CATEGORY_TIMEOUT_MS })
         ]);
 
         const pick = r => (r.status === 'fulfilled' && Array.isArray(r.value)) ? r.value : [];
@@ -562,7 +569,7 @@ function compactStream(item, kind) {
 }
 
 async function getStreams(cfg, action, catParam = '', kind) {
-    const data = await xtremioGet(cfg, action, catParam);
+    const data = await xtremioGet(cfg, action, catParam, { timeoutMs: LIST_TIMEOUT_MS });
     return Array.isArray(data) ? data.map(item => compactStream(item, kind)) : [];
 }
 
