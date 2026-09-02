@@ -18,23 +18,25 @@ services:
       # download. Metadata keeps the shorter timeout; catalog lists get more
       # time because an empty result is not useful to Stremio.
       UPSTREAM_CATEGORY_TIMEOUT_MS: 30000
-      UPSTREAM_LIST_TIMEOUT_MS: 90000
+      UPSTREAM_LIST_TIMEOUT_MS: 120000
+      # Serialize large list downloads to prevent concurrent JSON payloads
+      # from exhausting the Node heap when Stremio requests multiple catalogs.
+      UPSTREAM_LIST_CONCURRENCY: 1
 
       # Keep this low for a single-user/small deployment.
       # Increase only if you intentionally serve multiple accounts.
-      CACHE_MAX_ACCOUNTS: 2
-      CACHE_MAX_METADATA: 128
+      CACHE_MAX_ACCOUNTS: 1
+      CACHE_MAX_METADATA: 64
 
     restart: unless-stopped
 
     # Catalog responses can be large before they are compacted and cached.
-    # Keep enough headroom for one large response without making the service
-    # needlessly large on small deployments.
+    # The list semaphore keeps one large JSON payload active at a time.
     deploy:
       resources:
         limits:
-          cpus: "0.50"
-          memory: 384M
+          cpus: "1.00"
+          memory: 512M
         reservations:
           memory: 32M
 

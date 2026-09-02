@@ -15,7 +15,8 @@ const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const ADDON_ID = 'org.xtremio.addon';
 const CATEGORY_TIMEOUT_MS = Math.max(15000, Number(process.env.UPSTREAM_CATEGORY_TIMEOUT_MS) || 30000);
-const LIST_TIMEOUT_MS = Math.max(30000, Number(process.env.UPSTREAM_LIST_TIMEOUT_MS) || 90000);
+const LIST_TIMEOUT_MS = Math.max(30000, Number(process.env.UPSTREAM_LIST_TIMEOUT_MS) || 120000);
+const LIST_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.UPSTREAM_LIST_CONCURRENCY) || 1));
 
 function getBaseUrl(req) {
     const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
@@ -366,6 +367,28 @@ class AsyncCache {
     }
 }
 
+class Semaphore {
+    constructor(limit) {
+        this.limit = limit;
+        this.active = 0;
+        this.queue = [];
+    }
+
+    async run(task) {
+        if (this.active >= this.limit) {
+            await new Promise(resolve => this.queue.push(resolve));
+        }
+
+        this.active++;
+        try {
+            return await task();
+        } finally {
+            this.active--;
+            this.queue.shift()?.();
+        }
+    }
+}
+
 const catCache = new AsyncCache(
     TTL.categories,
     STALE.categories,
@@ -380,6 +403,7 @@ const seriesStreamsCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUN
 const liveCategoryCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS * 64);
 const vodCategoryCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS * 256);
 const seriesCategoryCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS * 256);
+const streamListSemaphore = new Semaphore(LIST_CONCURRENCY);
 
 const seriesInfoCache = new AsyncCache(
     TTL.seriesInfo,
@@ -475,7 +499,7 @@ function filterCategoryItems(items, categoryId, categoryName) {
 }
 
 const sortedCatalogCache = new WeakMap();
-const MAX_SORT_CACHE_ITEMS = 10000;
+const MAX_SORT_CACHE_ITEMS = 5000;
 
 function sortCatalogItems(items, sort, idField) {
     if (!sort) return items;
@@ -569,8 +593,10 @@ function compactStream(item, kind) {
 }
 
 async function getStreams(cfg, action, catParam = '', kind) {
-    const data = await xtremioGet(cfg, action, catParam, { timeoutMs: LIST_TIMEOUT_MS });
-    return Array.isArray(data) ? data.map(item => compactStream(item, kind)) : [];
+    return streamListSemaphore.run(async () => {
+        const data = await xtremioGet(cfg, action, catParam, { timeoutMs: LIST_TIMEOUT_MS });
+        return Array.isArray(data) ? data.map(item => compactStream(item, kind)) : [];
+    });
 }
 
 function parseYear(s) {

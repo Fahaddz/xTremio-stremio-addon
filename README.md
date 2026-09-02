@@ -10,6 +10,7 @@ Optimized self-hosted Stremio addon for Xtream Codes.
 - Full VOD/series snapshots are loaded only for global search; live snapshots are loaded only when live metadata needs them.
 - Cached catalog records are projected down to only the fields required by Stremio.
 - Sorted category orders are reused across pagination without retaining unlimited sort copies.
+- Large stream-list downloads are serialized to keep concurrent Stremio catalog requests from exhausting memory.
 - Request de-duplication: concurrent cache misses for the same key share one upstream request.
 - Separate cache lifetimes:
   - Categories: 6h fresh / 24h stale
@@ -46,7 +47,8 @@ For a direct Node.js deployment, run `npm ci --omit=dev && npm start`.
 | `CACHE_MAX_ACCOUNTS` | `2` | Maximum account snapshots retained in the main caches |
 | `CACHE_MAX_METADATA` | `128` | Maximum movie/series metadata entries retained |
 | `UPSTREAM_CATEGORY_TIMEOUT_MS` | `30000` | Maximum time for category API calls |
-| `UPSTREAM_LIST_TIMEOUT_MS` | `90000` | Maximum time for stream-list API calls |
+| `UPSTREAM_LIST_TIMEOUT_MS` | `120000` | Maximum time for stream-list API calls |
+| `UPSTREAM_LIST_CONCURRENCY` | `1` | Maximum simultaneous large stream-list downloads |
 
 The caches use stale-while-revalidate. Complete responses can be served stale while
 one background refresh runs; incomplete category and metadata responses are not retained.

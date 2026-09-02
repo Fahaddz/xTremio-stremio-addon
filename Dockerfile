@@ -6,7 +6,7 @@ WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3000 \
     HOST=0.0.0.0 \
-    NODE_OPTIONS=--max-old-space-size=256
+    NODE_OPTIONS=--max-old-space-size=384
 
 COPY package*.json ./
 
