@@ -20,6 +20,11 @@ services:
       UPSTREAM_CATEGORY_TIMEOUT_MS: 30000
       UPSTREAM_LIST_TIMEOUT_MS: 120000
       UPSTREAM_LIST_TTL_MS: 1200000
+      # Refresh used full snapshots in the background so a week-old install
+      # does not wait for a cold search request.
+      UPSTREAM_BACKGROUND_REFRESH_MS: 7200000
+      UPSTREAM_CATEGORY_REFRESH_MS: 21600000
+      UPSTREAM_SERIES_INFO_REFRESH_MS: 21600000
       # Serialize large list downloads to prevent concurrent JSON payloads
       # from exhausting the Node heap when Stremio requests multiple catalogs.
       UPSTREAM_LIST_CONCURRENCY: 1

@@ -18,6 +18,9 @@ const CATEGORY_TIMEOUT_MS = Math.max(15000, Number(process.env.UPSTREAM_CATEGORY
 const LIST_TIMEOUT_MS = Math.max(30000, Number(process.env.UPSTREAM_LIST_TIMEOUT_MS) || 120000);
 const LIST_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.UPSTREAM_LIST_CONCURRENCY) || 1));
 const LIST_CACHE_TTL_MS = Math.max(1000, Number(process.env.UPSTREAM_LIST_TTL_MS) || 20 * 60 * 1000);
+const BACKGROUND_REFRESH_MS = Math.max(1000, Number(process.env.UPSTREAM_BACKGROUND_REFRESH_MS) || 2 * 60 * 60 * 1000);
+const CATEGORY_REFRESH_MS = Math.max(1000, Number(process.env.UPSTREAM_CATEGORY_REFRESH_MS) || 6 * 60 * 60 * 1000);
+const SERIES_INFO_REFRESH_MS = Math.max(1000, Number(process.env.UPSTREAM_SERIES_INFO_REFRESH_MS) || 6 * 60 * 60 * 1000);
 const FULL_LIST_STALE_MS = process.env.UPSTREAM_LIST_STALE_MS?.toLowerCase() === 'infinite'
     ? Infinity
     : Math.max(LIST_CACHE_TTL_MS, 2 * 60 * 60 * 1000, Number(process.env.UPSTREAM_LIST_STALE_MS) || 7 * 24 * 60 * 60 * 1000);
@@ -317,6 +320,7 @@ class AsyncCache {
         const entry = this.getEntry(key);
 
         if (entry) {
+            entry.loader = loader;
             const age = now - entry.ts;
             if (age < this.ttl) return entry.data;
 
@@ -341,7 +345,7 @@ class AsyncCache {
                 if (!this.shouldCache(data)) return data;
 
                 this.map.delete(key);
-                this.map.set(key, { data, ts: Date.now() });
+                this.map.set(key, { data, ts: Date.now(), loader });
 
                 while (this.map.size > this.maxEntries) {
                     this.map.delete(this.map.keys().next().value);
@@ -352,6 +356,25 @@ class AsyncCache {
 
         this.inflight.set(key, promise);
         return promise;
+    }
+
+    refreshAll(concurrency = Infinity) {
+        const entries = [...this.map.entries()].filter(([, entry]) => entry.loader);
+        if (!entries.length) return Promise.resolve();
+
+        let next = 0;
+        const worker = async () => {
+            while (next < entries.length) {
+                const [key, entry] = entries[next++];
+                if (this.map.get(key) !== entry) continue;
+                await this.refresh(key, entry.loader).catch(() => {});
+            }
+        };
+
+        const workers = concurrency === Infinity
+            ? entries.length
+            : Math.max(1, Math.min(entries.length, concurrency));
+        return Promise.all(Array.from({ length: workers }, worker));
     }
 
     delete(key) {
@@ -393,6 +416,8 @@ class Semaphore {
     }
 }
 
+const hasListItems = data => Array.isArray(data) && data.length > 0;
+
 const catCache = new AsyncCache(
     TTL.categories,
     STALE.categories,
@@ -402,9 +427,9 @@ const catCache = new AsyncCache(
 // A previously successful full snapshot remains usable after long idle
 // periods. The next request gets it immediately while refreshing in the
 // background, avoiding a cold search after the normal stale window.
-const liveStreamsCache = new AsyncCache(TTL.catalog, FULL_LIST_STALE_MS, MAX_ACCOUNTS);
-const vodStreamsCache = new AsyncCache(TTL.catalog, FULL_LIST_STALE_MS, MAX_ACCOUNTS);
-const seriesStreamsCache = new AsyncCache(TTL.catalog, FULL_LIST_STALE_MS, MAX_ACCOUNTS);
+const liveStreamsCache = new AsyncCache(TTL.catalog, FULL_LIST_STALE_MS, MAX_ACCOUNTS, hasListItems);
+const vodStreamsCache = new AsyncCache(TTL.catalog, FULL_LIST_STALE_MS, MAX_ACCOUNTS, hasListItems);
+const seriesStreamsCache = new AsyncCache(TTL.catalog, FULL_LIST_STALE_MS, MAX_ACCOUNTS, hasListItems);
 
 // Category-specific caches are the main RAM optimization for large providers.
 const liveCategoryCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS * 64);
@@ -424,6 +449,27 @@ const movieInfoCache = new AsyncCache(
     MAX_METADATA,
     isUsableMovieInfo
 );
+
+// Refresh only caches that have already been used. This keeps the service
+// stateless and avoids downloading every provider's catalog unnecessarily.
+const backgroundRefreshTimer = setInterval(() => {
+    liveStreamsCache.refreshAll();
+    vodStreamsCache.refreshAll();
+    seriesStreamsCache.refreshAll();
+}, BACKGROUND_REFRESH_MS);
+backgroundRefreshTimer.unref();
+
+const categoryRefreshTimer = setInterval(() => {
+    catCache.refreshAll();
+}, CATEGORY_REFRESH_MS);
+categoryRefreshTimer.unref();
+
+const seriesInfoRefreshTimer = setInterval(() => {
+    // Series metadata is refreshed one at a time so a large watch history
+    // cannot create a burst of provider requests or JSON allocations.
+    seriesInfoCache.refreshAll(1);
+}, SERIES_INFO_REFRESH_MS);
+seriesInfoRefreshTimer.unref();
 
 async function getCategories(cfg) {
     const key = accountCacheKey(cfg);

@@ -11,6 +11,8 @@ Optimized self-hosted Stremio addon for Xtream Codes.
 - Cached catalog records are projected down to only the fields required by Stremio.
 - Sorted category orders are reused across pagination without retaining unlimited sort copies.
 - Large stream-list downloads are serialized to keep concurrent Stremio catalog requests from exhausting memory.
+- Previously used full snapshots refresh every two hours in the background; categories refresh every six hours.
+- Previously opened series metadata refreshes every six hours in the background so new episodes are ready before the next visit.
 - Request de-duplication: concurrent cache misses for the same key share one upstream request.
 - Separate cache lifetimes:
   - Categories: 6h fresh / 24h stale
@@ -51,6 +53,9 @@ For a direct Node.js deployment, run `npm ci --omit=dev && npm start`.
 | `UPSTREAM_LIST_TTL_MS` | `1200000` | Freshness period for stream-list caches |
 | `UPSTREAM_LIST_CONCURRENCY` | `1` | Maximum simultaneous large stream-list downloads |
 | `UPSTREAM_LIST_STALE_MS` | `infinite` | How long a successful full snapshot may be served while refreshing |
+| `UPSTREAM_BACKGROUND_REFRESH_MS` | `7200000` | Refresh interval for used full snapshots |
+| `UPSTREAM_CATEGORY_REFRESH_MS` | `21600000` | Refresh interval for used category snapshots |
+| `UPSTREAM_SERIES_INFO_REFRESH_MS` | `21600000` | Refresh interval for cached series metadata |
 
 The caches use stale-while-revalidate. Complete responses can be served stale while
 one background refresh runs; incomplete category and metadata responses are not retained.
