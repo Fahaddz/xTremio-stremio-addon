@@ -17,6 +17,10 @@ const ADDON_ID = 'org.xtremio.addon';
 const CATEGORY_TIMEOUT_MS = Math.max(15000, Number(process.env.UPSTREAM_CATEGORY_TIMEOUT_MS) || 30000);
 const LIST_TIMEOUT_MS = Math.max(30000, Number(process.env.UPSTREAM_LIST_TIMEOUT_MS) || 120000);
 const LIST_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.UPSTREAM_LIST_CONCURRENCY) || 1));
+const LIST_CACHE_TTL_MS = Math.max(1000, Number(process.env.UPSTREAM_LIST_TTL_MS) || 20 * 60 * 1000);
+const FULL_LIST_STALE_MS = process.env.UPSTREAM_LIST_STALE_MS?.toLowerCase() === 'infinite'
+    ? Infinity
+    : Math.max(LIST_CACHE_TTL_MS, 2 * 60 * 60 * 1000, Number(process.env.UPSTREAM_LIST_STALE_MS) || 7 * 24 * 60 * 60 * 1000);
 
 function getBaseUrl(req) {
     const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
@@ -263,7 +267,7 @@ function pickBackdrop(value) {
 
 const TTL = Object.freeze({
     categories: 6 * 60 * 60 * 1000,
-    catalog: 20 * 60 * 1000,
+    catalog: LIST_CACHE_TTL_MS,
     seriesInfo: 10 * 60 * 1000,
     movieInfo: 6 * 60 * 60 * 1000
 });
@@ -395,9 +399,12 @@ const catCache = new AsyncCache(
     MAX_ACCOUNTS,
     data => data?.complete !== false
 );
-const liveStreamsCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS);
-const vodStreamsCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS);
-const seriesStreamsCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS);
+// A previously successful full snapshot remains usable after long idle
+// periods. The next request gets it immediately while refreshing in the
+// background, avoiding a cold search after the normal stale window.
+const liveStreamsCache = new AsyncCache(TTL.catalog, FULL_LIST_STALE_MS, MAX_ACCOUNTS);
+const vodStreamsCache = new AsyncCache(TTL.catalog, FULL_LIST_STALE_MS, MAX_ACCOUNTS);
+const seriesStreamsCache = new AsyncCache(TTL.catalog, FULL_LIST_STALE_MS, MAX_ACCOUNTS);
 
 // Category-specific caches are the main RAM optimization for large providers.
 const liveCategoryCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS * 64);

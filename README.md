@@ -48,7 +48,9 @@ For a direct Node.js deployment, run `npm ci --omit=dev && npm start`.
 | `CACHE_MAX_METADATA` | `128` | Maximum movie/series metadata entries retained |
 | `UPSTREAM_CATEGORY_TIMEOUT_MS` | `30000` | Maximum time for category API calls |
 | `UPSTREAM_LIST_TIMEOUT_MS` | `120000` | Maximum time for stream-list API calls |
+| `UPSTREAM_LIST_TTL_MS` | `1200000` | Freshness period for stream-list caches |
 | `UPSTREAM_LIST_CONCURRENCY` | `1` | Maximum simultaneous large stream-list downloads |
+| `UPSTREAM_LIST_STALE_MS` | `infinite` | How long a successful full snapshot may be served while refreshing |
 
 The caches use stale-while-revalidate. Complete responses can be served stale while
 one background refresh runs; incomplete category and metadata responses are not retained.
