@@ -1,8 +1,8 @@
 const express = require('express');
-const { Readable } = require('stream');
+const { Readable, pipeline } = require('stream');
 
 const app = express();
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: false, limit: '16kb' }));
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -158,7 +158,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 
     return {
         id: ADDON_ID,
-        version: '1.0.2',
+        version: '1.1.1',
         name: 'xTremio',
         description: 'xTremio addon for Stremio',
         resources: ['catalog', 'meta', 'stream'],
@@ -184,7 +184,7 @@ app.get('/:config/manifest.json', async (req, res) => {
 
 function normalizeUrl(url) {
     url = url.trim().replace(/\/+$/, '');
-    if (!/^https?:\/\//.test(url)) url = 'http://' + url;
+    if (!/^https?:\/\//i.test(url)) url = 'http://' + url;
     return url;
 }
 
@@ -210,9 +210,6 @@ async function xtremioGet(cfg, action, extraParams = '', { timeoutMs = 15000 } =
         const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
         if (!res.ok) throw new Error(`xtremio ${action} failed: HTTP ${res.status}`);
         const data = await res.json();
-
-        console.log(`[xtremioGet] ${action} (${Array.isArray(data) ? data.length : '?'} items)`);
-
         return data;
     } finally {
         clearTimeout(timer);
@@ -239,104 +236,334 @@ function pickBackdrop(value) {
     return String(value) || undefined;
 }
 
-// All in-memory caches share the same TTL.
-const CACHE_TTL = 30 * 60 * 1000;
+// ---------------------------------------------------------------------------
+// High-performance in-memory caching
+// ---------------------------------------------------------------------------
+// The addon is intentionally stateless: no DB/Redis is needed.  Caches are
+// per Xtream account and use stale-while-revalidate so an expired entry can
+// still be served immediately while a single background refresh runs.
+//
+// TTLs are deliberately different:
+//   categories      6h fresh / 24h stale
+//   catalog lists   20m fresh / 2h stale
+//   series info      10m fresh / 1h stale (keeps new episodes reasonably fresh)
+//   movie info       6h fresh / 24h stale
+//
+// Full VOD/series/live lists are only cached when needed (global search or
+// a fallback). Normal category browsing uses category-specific snapshots,
+// which dramatically reduces RAM for large providers.
 
-// Keys must include credentials so two users on the same Xtream host don't
-// share cached catalogs/streams (different accounts can see different content).
+const TTL = Object.freeze({
+    categories: 6 * 60 * 60 * 1000,
+    catalog: 20 * 60 * 1000,
+    seriesInfo: 10 * 60 * 1000,
+    movieInfo: 6 * 60 * 60 * 1000
+});
+
+const STALE = Object.freeze({
+    categories: 24 * 60 * 60 * 1000,
+    catalog: 2 * 60 * 60 * 1000,
+    seriesInfo: 60 * 60 * 1000,
+    movieInfo: 24 * 60 * 60 * 1000
+});
+
+const MAX_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_ACCOUNTS) || 2);
+const MAX_METADATA = Math.max(32, Number(process.env.CACHE_MAX_METADATA) || 128);
+
 function accountCacheKey(cfg) {
     return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}`;
 }
 
-const catCache = new Map();
+class AsyncCache {
+    constructor(ttl, stale, maxEntries = Infinity, shouldCache = () => true) {
+        this.ttl = ttl;
+        this.stale = stale;
+        this.maxEntries = maxEntries;
+        this.shouldCache = shouldCache;
+        this.map = new Map();
+        this.inflight = new Map();
+    }
+
+    getEntry(key) {
+        const entry = this.map.get(key);
+        if (!entry) return null;
+        // Map insertion order becomes LRU order.
+        this.map.delete(key);
+        this.map.set(key, entry);
+        return entry;
+    }
+
+    getFresh(key) {
+        const entry = this.getEntry(key);
+        if (!entry) return null;
+        const age = Date.now() - entry.ts;
+        return age < this.ttl ? entry.data : null;
+    }
+
+    async get(key, loader) {
+        const now = Date.now();
+        const entry = this.getEntry(key);
+
+        if (entry) {
+            const age = now - entry.ts;
+            if (age < this.ttl) return entry.data;
+
+            // Stale-while-revalidate: never make the user wait for a normal
+            // refresh. Only one refresh is allowed for each cache key.
+            if (age < this.stale) {
+                this.refresh(key, loader).catch(() => {});
+                return entry.data;
+            }
+        }
+
+        return this.refresh(key, loader);
+    }
+
+    refresh(key, loader) {
+        const running = this.inflight.get(key);
+        if (running) return running;
+
+        const promise = Promise.resolve()
+            .then(loader)
+            .then(data => {
+                if (!this.shouldCache(data)) return data;
+
+                this.map.delete(key);
+                this.map.set(key, { data, ts: Date.now() });
+
+                while (this.map.size > this.maxEntries) {
+                    this.map.delete(this.map.keys().next().value);
+                }
+                return data;
+            })
+            .finally(() => this.inflight.delete(key));
+
+        this.inflight.set(key, promise);
+        return promise;
+    }
+
+    delete(key) {
+        this.map.delete(key);
+    }
+
+    clear() {
+        this.map.clear();
+        this.inflight.clear();
+    }
+
+    sweep() {
+        const cutoff = Date.now() - this.stale;
+        for (const [key, entry] of this.map) {
+            if (entry.ts < cutoff) this.map.delete(key);
+        }
+    }
+}
+
+const catCache = new AsyncCache(
+    TTL.categories,
+    STALE.categories,
+    MAX_ACCOUNTS,
+    data => data?.complete !== false
+);
+const liveStreamsCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS);
+const vodStreamsCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS);
+const seriesStreamsCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS);
+
+// Category-specific caches are the main RAM optimization for large providers.
+const liveCategoryCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS * 64);
+const vodCategoryCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS * 256);
+const seriesCategoryCache = new AsyncCache(TTL.catalog, STALE.catalog, MAX_ACCOUNTS * 256);
+
+const seriesInfoCache = new AsyncCache(
+    TTL.seriesInfo,
+    STALE.seriesInfo,
+    MAX_METADATA,
+    isUsableSeriesInfo
+);
+const movieInfoCache = new AsyncCache(
+    TTL.movieInfo,
+    STALE.movieInfo,
+    MAX_METADATA,
+    isUsableMovieInfo
+);
 
 async function getCategories(cfg) {
     const key = accountCacheKey(cfg);
-    const cached = catCache.get(key);
-    if (cached && cached.ts > Date.now() - CACHE_TTL) return cached;
-    const results = await Promise.allSettled([
-        xtremioGet(cfg, 'get_live_categories'),
-        xtremioGet(cfg, 'get_vod_categories'),
-        xtremioGet(cfg, 'get_series_categories')
-    ]);
-    const pick = r => (r.status === 'fulfilled' && Array.isArray(r.value)) ? r.value : [];
-    results.forEach((r, i) => {
-        if (r.status === 'rejected') {
-            console.error(`[getCategories] source ${i} failed:`, r.reason?.message || r.reason);
-        }
+    return catCache.get(key, async () => {
+        const results = await Promise.allSettled([
+            xtremioGet(cfg, 'get_live_categories'),
+            xtremioGet(cfg, 'get_vod_categories'),
+            xtremioGet(cfg, 'get_series_categories')
+        ]);
+
+        const pick = r => (r.status === 'fulfilled' && Array.isArray(r.value)) ? r.value : [];
+
+        results.forEach((r, i) => {
+            if (r.status === 'rejected') {
+                console.error(`[getCategories] source ${i} failed:`, r.reason?.message || r.reason);
+            }
+        });
+
+        return {
+            live: pick(results[0]),
+            movies: pick(results[1]),
+            series: pick(results[2]),
+            complete: results.every(r => r.status === 'fulfilled' && Array.isArray(r.value))
+        };
     });
-    const entry = {
-        live: pick(results[0]),
-        movies: pick(results[1]),
-        series: pick(results[2]),
-        ts: Date.now()
-    };
-    catCache.set(key, entry);
-    return entry;
 }
-
-// Stream list caches - populated on first fetch, reused for catalogs, search and meta
-function createStreamListCache() {
-    const map = new Map();
-    return {
-        get(cfg) {
-            const cached = map.get(accountCacheKey(cfg));
-            if (cached && cached.ts > Date.now() - CACHE_TTL) return cached.data;
-            return null;
-        },
-        set(cfg, items) {
-            map.set(accountCacheKey(cfg), { data: items, ts: Date.now() });
-        }
-    };
-}
-
-const liveStreamsCache = createStreamListCache();
-const vodStreamsCache = createStreamListCache();
-const seriesStreamsCache = createStreamListCache();
 
 async function getAllVodStreams(cfg) {
-    let items = vodStreamsCache.get(cfg);
-    if (!items) {
-        items = await getStreams(cfg, 'get_vod_streams', '');
-        vodStreamsCache.set(cfg, items);
-    }
-    return items;
+    return vodStreamsCache.get(accountCacheKey(cfg), async () =>
+        getStreams(cfg, 'get_vod_streams', '', 'movie'));
 }
 
 async function getAllSeriesStreams(cfg) {
-    let items = seriesStreamsCache.get(cfg);
-    if (!items) {
-        items = await getStreams(cfg, 'get_series', '');
-        seriesStreamsCache.set(cfg, items);
-    }
-    return items;
+    return seriesStreamsCache.get(accountCacheKey(cfg), async () =>
+        getStreams(cfg, 'get_series', '', 'series'));
 }
 
 async function getAllLiveStreams(cfg) {
-    let items = liveStreamsCache.get(cfg);
-    if (!items) {
-        items = await getStreams(cfg, 'get_live_streams', '');
-        liveStreamsCache.set(cfg, items);
-    }
-    return items;
+    return liveStreamsCache.get(accountCacheKey(cfg), async () =>
+        getStreams(cfg, 'get_live_streams', '', 'live'));
 }
 
-function parseExtra(extra) {
-    const params = {};
-    if (extra) {
-        extra.split('&').forEach(p => {
-            const [k, ...rest] = p.split('=');
-            params[decodeURIComponent(k)] = decodeURIComponent(rest.join('='));
-        });
+async function getCategoryStreams(cfg, kind, categoryId) {
+    const id = String(categoryId);
+    const key = `${accountCacheKey(cfg)}\n${id}`;
+
+    let cache, action;
+    if (kind === 'live') {
+        cache = liveCategoryCache;
+        action = 'get_live_streams';
+    } else if (kind === 'movie') {
+        cache = vodCategoryCache;
+        action = 'get_vod_streams';
+    } else {
+        cache = seriesCategoryCache;
+        action = 'get_series';
     }
+
+    return cache.get(key, async () =>
+        getStreams(cfg, action, `&category_id=${encodeURIComponent(id)}`, kind));
+}
+
+function filterCategoryItems(items, categoryId, categoryName) {
+    // Some providers omit category fields when the API is already scoped to
+    // one category. In that case, preserve the provider's scoped response.
+    const hasCategoryFields = items.some(item => item.category_id || item.category_name);
+    if (!hasCategoryFields) return items;
+
+    const id = String(categoryId);
+    const name = String(categoryName || '').toLowerCase();
+    const matches = item => {
+        if (item.category_id) return item.category_id === id;
+        return Boolean(name) && item.category_name.toLowerCase() === name;
+    };
+
+    // Keep the cached array when the provider already returned the requested
+    // category. This avoids an allocation on every paginated request.
+    if (!items.some(item => !matches(item))) return items;
+    return items.filter(matches);
+}
+
+const sortedCatalogCache = new WeakMap();
+const MAX_SORT_CACHE_ITEMS = 10000;
+
+function sortCatalogItems(items, sort, idField) {
+    if (!sort) return items;
+
+    const daySeed = sort === 'featured' ? Math.floor(Date.now() / 86400000) : 0;
+    const cacheKey = `${sort}:${daySeed}`;
+    const cached = sortedCatalogCache.get(items);
+    if (cached?.key === cacheKey) return cached.items;
+
+    const sorted = [...items].sort((a, b) => {
+        if (sort === 'new') return b.added - a.added;
+        if (sort === 'popular') return b.rating - a.rating;
+
+        const ha = ((Number.parseInt(a[idField], 10) || 0) * 2654435761 + daySeed) & 0x7fffffff;
+        const hb = ((Number.parseInt(b[idField], 10) || 0) * 2654435761 + daySeed) & 0x7fffffff;
+        return ha - hb;
+    });
+
+    // Keep one derived order per category. Large categories are deliberately
+    // not retained twice, so sorting cannot become a memory spike.
+    if (items.length <= MAX_SORT_CACHE_ITEMS) {
+        sortedCatalogCache.set(items, { key: cacheKey, items: sorted });
+    }
+    return sorted;
+}
+
+// Periodically remove old snapshots without requiring a request to trigger GC.
+// Unref means this timer never keeps the process alive.
+const sweepTimer = setInterval(() => {
+    catCache.sweep();
+    liveStreamsCache.sweep();
+    vodStreamsCache.sweep();
+    seriesStreamsCache.sweep();
+    liveCategoryCache.sweep();
+    vodCategoryCache.sweep();
+    seriesCategoryCache.sweep();
+    seriesInfoCache.sweep();
+    movieInfoCache.sweep();
+}, 15 * 60 * 1000);
+sweepTimer.unref();
+
+function parseExtra(extra) {
+    const params = Object.create(null);
+    if (!extra) return params;
+    for (const [key, value] of new URLSearchParams(extra)) params[key] = value;
     return params;
 }
 
 const PAGE_SIZE = 100;
 
-async function getStreams(cfg, action, catParam = '') {
+// Catalog responses contain many provider-specific fields that are never
+// returned to Stremio. Keep only the fields needed for filtering, sorting,
+// catalog pages, and live metadata lookups.
+function compactStream(item, kind) {
+    item = item && typeof item === 'object' ? item : {};
+    const categoryId = item.category_id == null ? '' : String(item.category_id);
+    const categoryName = item.category_name == null ? '' : String(item.category_name);
+    const id = item.stream_id == null ? '' : String(item.stream_id);
+
+    if (kind === 'live') {
+        return {
+            stream_id: id,
+            name: String(item.name || ''),
+            stream_icon: item.stream_icon || '',
+            category_id: categoryId,
+            category_name: categoryName
+        };
+    }
+
+    if (kind === 'movie') {
+        return {
+            stream_id: id,
+            name: String(item.name || ''),
+            stream_icon: item.stream_icon || '',
+            category_id: categoryId,
+            category_name: categoryName,
+            rating: Number.parseFloat(item.rating) || 0,
+            added: Number.parseInt(item.added, 10) || 0
+        };
+    }
+
+    return {
+        series_id: item.series_id == null ? '' : String(item.series_id),
+        name: String(item.name || ''),
+        cover: item.cover || '',
+        category_id: categoryId,
+        category_name: categoryName,
+        rating: Number.parseFloat(item.rating) || 0,
+        added: Number.parseInt(item.last_modified, 10) || 0
+    };
+}
+
+async function getStreams(cfg, action, catParam = '', kind) {
     const data = await xtremioGet(cfg, action, catParam);
-    return Array.isArray(data) ? data : [];
+    return Array.isArray(data) ? data.map(item => compactStream(item, kind)) : [];
 }
 
 function parseYear(s) {
@@ -344,6 +571,9 @@ function parseYear(s) {
     const m = String(s).match(/\d{4}/);
     return m ? parseInt(m[0]) : undefined;
 }
+
+const SERIES_INFO_MAX_ATTEMPTS = 3;
+const SERIES_INFO_BACKOFF_MS = 350;
 
 function isUsableSeriesInfo(info) {
     if (!info || typeof info !== 'object') return false;
@@ -354,51 +584,55 @@ function isUsableSeriesInfo(info) {
     return Boolean(hasInfo || hasEpisodes);
 }
 
-const SERIES_INFO_MAX_ATTEMPTS = 3;
-const SERIES_INFO_BACKOFF_MS = 500;
-
-const seriesInfoCache = new Map();
-
-function seriesInfoCacheKey(cfg, seriesId) {
-    return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}\n${seriesId}`;
-}
-
-function getCachedSeriesInfo(cfg, seriesId) {
-    const entry = seriesInfoCache.get(seriesInfoCacheKey(cfg, seriesId));
-    if (entry && entry.ts > Date.now() - CACHE_TTL) return entry.data;
-    return null;
-}
-
-function setCachedSeriesInfo(cfg, seriesId, data) {
-    seriesInfoCache.set(seriesInfoCacheKey(cfg, seriesId), { data, ts: Date.now() });
+function isUsableMovieInfo(info) {
+    if (!info || typeof info !== 'object') return false;
+    const movie = info.info && typeof info.info === 'object' ? info.info : info;
+    return Boolean(
+        info.movie_data ||
+        movie.name ||
+        movie.cover_big ||
+        movie.movie_image ||
+        movie.plot ||
+        movie.releasedate
+    );
 }
 
 async function getSeriesInfo(cfg, seriesId) {
-    const hit = getCachedSeriesInfo(cfg, seriesId);
-    if (hit) return hit;
+    const key = `${accountCacheKey(cfg)}\n${seriesId}`;
 
-    let lastInfo = null;
-    let lastError = null;
-    for (let attempt = 1; attempt <= SERIES_INFO_MAX_ATTEMPTS; attempt++) {
-        try {
-            const info = await xtremioGet(cfg, 'get_series_info', `&series_id=${seriesId}`, { timeoutMs: 8000 });
-            if (isUsableSeriesInfo(info)) {
-                setCachedSeriesInfo(cfg, seriesId, info);
-                return info;
+    return seriesInfoCache.get(key, async () => {
+        let lastInfo = null;
+        let lastError = null;
+
+        for (let attempt = 1; attempt <= SERIES_INFO_MAX_ATTEMPTS; attempt++) {
+            try {
+                const info = await xtremioGet(
+                    cfg,
+                    'get_series_info',
+                    `&series_id=${encodeURIComponent(seriesId)}`,
+                    { timeoutMs: 8000 }
+                );
+
+                if (isUsableSeriesInfo(info)) return info;
+                lastInfo = info;
+            } catch (e) {
+                lastError = e;
             }
-            lastInfo = info;
-            console.warn(`[getSeriesInfo] attempt ${attempt}/${SERIES_INFO_MAX_ATTEMPTS} for series ${seriesId} returned unusable data`);
-        } catch (e) {
-            lastError = e;
-            const causeMsg = e.cause ? ` (cause: ${e.cause.code || e.cause.message || e.cause})` : '';
-            console.warn(`[getSeriesInfo] attempt ${attempt}/${SERIES_INFO_MAX_ATTEMPTS} for series ${seriesId} failed: ${e.message}${causeMsg}`);
+
+            if (attempt < SERIES_INFO_MAX_ATTEMPTS) {
+                await new Promise(r => setTimeout(r, SERIES_INFO_BACKOFF_MS * attempt));
+            }
         }
-        if (attempt < SERIES_INFO_MAX_ATTEMPTS) {
-            await new Promise(r => setTimeout(r, SERIES_INFO_BACKOFF_MS * attempt));
-        }
-    }
-    if (lastInfo !== null) return lastInfo;
-    throw lastError || new Error(`get_series_info failed for series ${seriesId}`);
+
+        if (lastInfo !== null) return lastInfo;
+        throw lastError || new Error(`get_series_info failed for series ${seriesId}`);
+    });
+}
+
+async function getMovieInfo(cfg, movieId) {
+    const key = `${accountCacheKey(cfg)}\n${movieId}`;
+    return movieInfoCache.get(key, () =>
+        xtremioGet(cfg, 'get_vod_info', `&vod_id=${encodeURIComponent(movieId)}`));
 }
 
 async function validateXtremioCredentials(serverUrl, username, password) {
@@ -460,19 +694,21 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
             const encoded = encodeConfig({ serverUrl, username, password });
             const installUrl = `stremio://${baseUrl.replace(/^https?:\/\//, '')}/${encoded}/manifest.json`;
             const httpUrl = `${baseUrl}/${encoded}/manifest.json`;
+            const safeInstallUrl = escapeHtml(installUrl);
+            const safeHttpUrl = escapeHtml(httpUrl);
             statusHtml = `
                 <div class="status-section">
                     <div class="status-banner status-success">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
                         <span class="status-text">Connected! Welcome, ${escapeHtml(status.userInfo.username || username)}</span>
                     </div>
-                    <a href="${installUrl}" class="btn full install-link">
+                    <a href="${safeInstallUrl}" class="btn full install-link">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
                         Install in Stremio
                     </a>
                     <div style="margin-top: 16px;">
                         <p style="font-size: 13px; color: #555; margin-bottom: 8px; font-weight: 600; text-align: left;">Or copy this link to install:</p>
-                        <input type="text" value="${httpUrl}" readonly onclick="this.select(); document.execCommand('copy'); const p = this.previousElementSibling; const orig = p.innerText; p.innerText = '✓ Copied to clipboard!'; p.style.color = '#2e7d32'; setTimeout(() => { p.innerText = orig; p.style.color = '#555'; }, 2000);" style="width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 10px; font-size: 14px; color: #333; background: #f9f9f9; cursor: pointer; text-align: center; transition: border-color 0.2s;" title="Click to copy install link" onmouseover="this.style.borderColor='#7c4dff'" onmouseout="this.style.borderColor='#e0e0e0'" />
+                        <input type="text" value="${safeHttpUrl}" readonly onclick="this.select(); document.execCommand('copy'); const p = this.previousElementSibling; const orig = p.innerText; p.innerText = '✓ Copied to clipboard!'; p.style.color = '#2e7d32'; setTimeout(() => { p.innerText = orig; p.style.color = '#555'; }, 2000);" style="width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 10px; font-size: 14px; color: #333; background: #f9f9f9; cursor: pointer; text-align: center; transition: border-color 0.2s;" title="Click to copy install link" onmouseover="this.style.borderColor='#7c4dff'" onmouseout="this.style.borderColor='#e0e0e0'" />
                     </div>
                 </div>`;
         } else {
@@ -641,7 +877,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
 
     const { id } = req.params;
     const extra = parseExtra(req.params.extra);
-    const skip = parseInt(extra.skip) || 0;
+    const skip = Math.max(0, Number.parseInt(extra.skip, 10) || 0);
     const genre = extra.genre;
 
     try {
@@ -657,16 +893,10 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             // No genre selected and none resolvable -> nothing to show.
             if (!categoryId) return res.json({ metas: [] });
 
-            // Fetch all live channels once (cached), then filter in-memory by selected category.
-            const allItems = await getAllLiveStreams(cfg);
-            const catIdStr = String(categoryId);
-            const selectedGenreLower = (selectedGenre || '').toLowerCase();
-            let items = allItems.filter(s => {
-                if (s.category_id != null && s.category_id !== '') {
-                    return String(s.category_id) === catIdStr;
-                }
-                return selectedGenreLower && String(s.category_name || '').toLowerCase() === selectedGenreLower;
-            });
+            // Fetch only the selected category. This avoids retaining the entire
+            // live-TV library in RAM just to render one page.
+            let items = await getCategoryStreams(cfg, 'live', categoryId);
+            items = filterCategoryItems(items, categoryId, selectedGenre);
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
@@ -691,31 +921,20 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             const cat = cats.movies.find(c => c.category_name === selectedGenre);
             if (!cat) return res.json({ metas: [] });
 
-            // Reuse the full-list cache if available; fall back to per-category fetch.
-            const catIdStr = String(cat.category_id);
-            const fullList = vodStreamsCache.get(cfg);
-            let items = fullList
-                ? fullList.filter(s => String(s.category_id) === catIdStr)
-                : await getStreams(cfg, 'get_vod_streams', `&category_id=${catIdStr}`);
+            // Category browsing uses a small per-category snapshot. The full
+            // library is fetched only when global search actually needs it.
+            let items = await getCategoryStreams(cfg, 'movie', cat.category_id);
+            items = filterCategoryItems(items, cat.category_id, selectedGenre);
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
                 items = items.filter(s => s.name?.toLowerCase().includes(q));
             }
 
-            if (id === 'xtremio_movies_new') {
-                items = [...items].sort((a, b) => (parseInt(b.added) || 0) - (parseInt(a.added) || 0));
-            } else if (id === 'xtremio_movies_popular') {
-                items = [...items].sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0));
-            } else if (id === 'xtremio_movies_featured') {
-                // Seeded shuffle based on the day so order is stable across pagination
-                const daySeed = Math.floor(Date.now() / 86400000);
-                items = [...items].sort((a, b) => {
-                    const ha = ((parseInt(a.stream_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    const hb = ((parseInt(b.stream_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    return ha - hb;
-                });
-            }
+            const sort = id === 'xtremio_movies_new' ? 'new'
+                : id === 'xtremio_movies_popular' ? 'popular'
+                    : 'featured';
+            items = sortCatalogItems(items, sort, 'stream_id');
 
             const page = items.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
@@ -735,30 +954,20 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             const cat = cats.series.find(c => c.category_name === selectedGenre);
             if (!cat) return res.json({ metas: [] });
 
-            // Reuse the full-list cache if available; fall back to per-category fetch.
-            const catIdStr = String(cat.category_id);
-            const fullList = seriesStreamsCache.get(cfg);
-            let items = fullList
-                ? fullList.filter(s => String(s.category_id) === catIdStr)
-                : await getStreams(cfg, 'get_series', `&category_id=${catIdStr}`);
+            // Category browsing uses a small per-category snapshot. The full
+            // library is fetched only when global search actually needs it.
+            let items = await getCategoryStreams(cfg, 'series', cat.category_id);
+            items = filterCategoryItems(items, cat.category_id, selectedGenre);
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
                 items = items.filter(s => s.name?.toLowerCase().includes(q));
             }
 
-            if (id === 'xtremio_series_new') {
-                items = [...items].sort((a, b) => (parseInt(b.last_modified) || 0) - (parseInt(a.last_modified) || 0));
-            } else if (id === 'xtremio_series_popular') {
-                items = [...items].sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0));
-            } else if (id === 'xtremio_series_featured') {
-                const daySeed = Math.floor(Date.now() / 86400000);
-                items = [...items].sort((a, b) => {
-                    const ha = ((parseInt(a.series_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    const hb = ((parseInt(b.series_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    return ha - hb;
-                });
-            }
+            const sort = id === 'xtremio_series_new' ? 'new'
+                : id === 'xtremio_series_popular' ? 'popular'
+                    : 'featured';
+            items = sortCatalogItems(items, sort, 'series_id');
 
             const page = items.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
@@ -814,7 +1023,6 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ meta: null });
     const { id, type } = req.params;
-    console.log(`[meta] type=${type} id=${id}`);
 
     try {
         if (id.startsWith('xtremio_live_')) {
@@ -837,7 +1045,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
 
         if (id.startsWith('xtremio_movie_')) {
             const streamId = id.replace('xtremio_movie_', '');
-            const info = await xtremioGet(cfg, 'get_vod_info', `&vod_id=${streamId}`);
+            const info = await getMovieInfo(cfg, streamId);
             const movie = info?.info ?? info ?? {};
             const cast = splitList(movie.cast);
             const backdrop = pickBackdrop(movie.backdrop_path);
@@ -860,7 +1068,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 country: movie.country || undefined,
                 trailer: movie.youtube_trailer || undefined
             };
-            return res.json({ meta, cacheMaxAge: 86400 });
+            return res.json({ meta, cacheMaxAge: 21600, staleRevalidate: 43200 });
         }
 
         if (id.startsWith('xtremio_series_')) {
@@ -917,7 +1125,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 year: parseYear(series.releaseDate),
                 videos
             };
-            return res.json({ meta, cacheMaxAge: 3600 });
+            return res.json({ meta, cacheMaxAge: 600, staleRevalidate: 1200 });
         }
 
         res.json({ meta: null });
@@ -931,19 +1139,20 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ streams: [] });
     const { id, type } = req.params;
-    console.log(`[stream] type=${type} id=${id}`);
 
     try {
         const { username, password } = cfg;
         const serverUrl = normalizeUrl(cfg.serverUrl);
+        const encodedUsername = encodeURIComponent(username);
+        const encodedPassword = encodeURIComponent(password);
 
         // --- Handle xTremio's own IDs ---
         if (id.startsWith('xtremio_live_')) {
             const streamId = id.replace('xtremio_live_', '');
             return res.json({
                 streams: [
-                    { url: `${serverUrl}/live/${username}/${password}/${streamId}.m3u8`, title: 'HLS' },
-                    { url: `${serverUrl}/live/${username}/${password}/${streamId}.ts`, title: 'MPEG-TS' }
+                    { url: `${serverUrl}/live/${encodedUsername}/${encodedPassword}/${streamId}.m3u8`, title: 'HLS' },
+                    { url: `${serverUrl}/live/${encodedUsername}/${encodedPassword}/${streamId}.ts`, title: 'MPEG-TS' }
                 ],
                 cacheMaxAge: 3600
             });
@@ -951,7 +1160,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
 
         if (id.startsWith('xtremio_movie_')) {
             const streamId = id.replace('xtremio_movie_', '');
-            const info = await xtremioGet(cfg, 'get_vod_info', `&vod_id=${streamId}`);
+            const info = await getMovieInfo(cfg, streamId);
             const ext = info?.movie_data?.container_extension || 'mp4';
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
             return res.json({
@@ -1048,6 +1257,7 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
     req.on('aborted', abort);
 
     const isAbortErr = (e) => e && (e.name === 'AbortError' || e.code === 'ABORT_ERR' || controller.signal.aborted);
+    const headerTimer = setTimeout(abort, 15000);
 
     let upstream;
     try {
@@ -1063,6 +1273,8 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
         }
         if (!res.headersSent) res.status(502).end('upstream fetch failed');
         return;
+    } finally {
+        clearTimeout(headerTimer);
     }
 
     res.status(upstream.status);
@@ -1090,19 +1302,16 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
     }
 
     const nodeStream = Readable.fromWeb(upstream.body);
-    nodeStream.on('error', (e) => {
-        if (!isAbortErr(e)) {
-            console.warn(`[proxy] stream error for ${kind}/${streamId}.${ext}: ${e.message}`);
-        }
-        if (!res.headersSent) res.status(502);
-        res.end();
-    });
     res.on('error', () => abort());
     res.on('close', () => {
         abort();
         nodeStream.destroy();
     });
-    nodeStream.pipe(res);
+    pipeline(nodeStream, res, (e) => {
+        if (e && !isAbortErr(e)) {
+            console.warn(`[proxy] stream error for ${kind}/${streamId}.${ext}: ${e.message}`);
+        }
+    });
 });
 
 app.get('/', (req, res) => {
@@ -1227,10 +1436,15 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime() });
 });
 
+// Keep HTTP connections reusable without retaining them for too long.
 const server = app.listen(PORT, HOST, () => {
     console.log(`Addon running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
     console.log(`Configure: http://localhost:${PORT}/configure`);
 });
+
+server.keepAliveTimeout = 30000;
+server.headersTimeout = 35000;
+server.requestTimeout = 30000;
 
 server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {

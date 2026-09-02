@@ -1,0 +1,61 @@
+services:
+  xtremio:
+    container_name: xtremio
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    ports:
+      - "3005:3000"
+
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+
+      # Keep this low for a single-user/small deployment.
+      # Increase only if you intentionally serve multiple accounts.
+      CACHE_MAX_ACCOUNTS: 2
+      CACHE_MAX_METADATA: 128
+
+    restart: unless-stopped
+
+    # 256 MiB gives Node enough headroom while keeping the container small.
+    # The app itself limits the V8 heap to 192 MiB.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          memory: 32M
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O - http://127.0.0.1:3000/health >/dev/null || exit 1
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+    stop_signal: SIGTERM
+    stop_grace_period: 5s
