@@ -1090,6 +1090,49 @@ app.post('/configure', async (req, res) => {
     }
 });
 
+app.get('/:config/configure', (req, res) => {
+    const cfg = decodeConfig(req.params.config);
+    if (!cfg) return res.redirect('/configure');
+    res.send(renderConfigPage({
+        serverUrl: cfg.serverUrl || '',
+        username: cfg.username || '',
+        password: cfg.password || '',
+        settings: getSettings(cfg),
+        baseUrl: getBaseUrl(req)
+    }));
+});
+
+app.post('/:config/configure', async (req, res) => {
+    const existing = decodeConfig(req.params.config) || {};
+    const settings = settingsFromForm(req.body, getSettings(existing));
+    const rawServerUrl = (req.body.serverUrl || '').trim().replace(/\/+$/, '');
+    const username = req.body.username || '';
+    const password = req.body.password || '';
+    try {
+        const validation = await validateXtremioCredentials(rawServerUrl, username, password);
+        const finalServerUrl = validation.valid
+            ? (validation.resolvedUrl || normalizeUrl(rawServerUrl))
+            : rawServerUrl;
+        res.send(renderConfigPage({
+            serverUrl: finalServerUrl,
+            username,
+            password,
+            settings,
+            status: validation,
+            baseUrl: getBaseUrl(req)
+        }));
+    } catch (e) {
+        res.send(renderConfigPage({
+            serverUrl: rawServerUrl,
+            username,
+            password,
+            settings,
+            status: { valid: false, error: 'Something went wrong. Please try again.' },
+            baseUrl: getBaseUrl(req)
+        }));
+    }
+});
+
 app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.json'], async (req, res) => {
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ metas: [] });
