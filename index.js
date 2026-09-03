@@ -1,5 +1,4 @@
 const express = require('express');
-const { Readable, pipeline } = require('stream');
 
 const app = express();
 app.use(express.urlencoded({ extended: false, limit: '16kb' }));
@@ -14,7 +13,6 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const ADDON_ID = 'org.xtremio.addon';
-const IS_VERCEL = process.env.VERCEL === '1' || Boolean(process.env.VERCEL_ENV);
 const CATEGORY_TIMEOUT_MS = Math.max(15000, Number(process.env.UPSTREAM_CATEGORY_TIMEOUT_MS) || 30000);
 const LIST_TIMEOUT_MS = Math.max(30000, Number(process.env.UPSTREAM_LIST_TIMEOUT_MS) || 120000);
 const LIST_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.UPSTREAM_LIST_CONCURRENCY) || 1));
@@ -263,9 +261,6 @@ function isNotWebReady(url, ext) {
     const isMp4 = String(ext || '').toLowerCase() === 'mp4';
     return !(isHttps && isMp4);
 }
-
-// Browser-like UA — many Xtream CDNs reject or shortchange non-browser UAs.
-const PROXY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 async function xtremioGet(cfg, action, extraParams = '', { timeoutMs = 15000 } = {}) {
     const base = normalizeUrl(cfg.serverUrl);
@@ -1359,15 +1354,13 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             const info = await getMovieInfo(cfg, streamId);
             const ext = info?.movie_data?.container_extension || 'mp4';
             const directUrl = `${serverUrl}/movie/${encodedUsername}/${encodedPassword}/${encodeURIComponent(streamId)}.${ext}`;
-            const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
-            const streamUrl = IS_VERCEL ? directUrl : proxyUrl;
             return res.json({
                 streams: [
                     {
-                        url: streamUrl,
+                        url: directUrl,
                         title: '▶ Play',
                         behaviorHints: {
-                            notWebReady: isNotWebReady(streamUrl, ext),
+                            notWebReady: isNotWebReady(directUrl, ext),
                             bingeGroup: `xtremio-movie-${ext}`
                         }
                     }
@@ -1397,15 +1390,13 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             }
 
             const directUrl = `${serverUrl}/series/${encodedUsername}/${encodedPassword}/${encodeURIComponent(episodeId)}.${ext}`;
-            const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/series/${episodeId}.${ext}`;
-            const streamUrl = IS_VERCEL ? directUrl : proxyUrl;
             return res.json({
                 streams: [
                     {
-                        url: streamUrl,
+                        url: directUrl,
                         title: '▶ Play',
                         behaviorHints: {
-                            notWebReady: isNotWebReady(streamUrl, ext),
+                            notWebReady: isNotWebReady(directUrl, ext),
                             bingeGroup: `xtremio-series-${seriesId}-${ext}`
                         }
                     }
@@ -1418,100 +1409,6 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
         console.error('[stream] Error:', e.message);
         res.json({ streams: [] });
     }
-});
-
-// Stream proxy. Xtream providers 302-redirect to a CDN URL that carries
-// a short-lived signed token (~60s). Handing that URL directly to
-// Stremio causes "playback error" after ~1 minute when the token
-// expires. By proxying every range request through the addon, we
-// re-resolve the origin URL (and get a fresh token) for each request.
-app.all('/:config/proxy/:kind/:file', async (req, res) => {
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-        return res.status(405).end('method not allowed');
-    }
-    const cfg = decodeConfig(req.params.config);
-    if (!cfg) return res.status(401).end('unauthorized');
-
-    const { kind, file } = req.params;
-    if (!['movie', 'series', 'live'].includes(kind)) {
-        return res.status(400).end('bad kind');
-    }
-    const match = /^([^./]+)\.([A-Za-z0-9]+)$/.exec(file);
-    if (!match) return res.status(400).end('bad file');
-    const [, streamId, ext] = match;
-
-    const serverUrl = normalizeUrl(cfg.serverUrl);
-    const upstreamUrl = `${serverUrl}/${kind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${streamId}.${ext}`;
-
-    const headers = { 'User-Agent': PROXY_USER_AGENT };
-    if (req.headers.range) headers['Range'] = req.headers.range;
-    if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
-
-    const controller = new AbortController();
-    const abort = () => {
-        if (!controller.signal.aborted) {
-            try { controller.abort(); } catch {}
-        }
-    };
-    req.on('close', abort);
-    req.on('aborted', abort);
-
-    const isAbortErr = (e) => e && (e.name === 'AbortError' || e.code === 'ABORT_ERR' || controller.signal.aborted);
-    const headerTimer = setTimeout(abort, 15000);
-
-    let upstream;
-    try {
-        upstream = await fetch(upstreamUrl, {
-            method: 'GET',
-            headers,
-            redirect: 'follow',
-            signal: controller.signal
-        });
-    } catch (e) {
-        if (!isAbortErr(e)) {
-            console.warn(`[proxy] upstream fetch failed for ${kind}/${streamId}.${ext}: ${e.message}`);
-        }
-        if (!res.headersSent) res.status(502).end('upstream fetch failed');
-        return;
-    } finally {
-        clearTimeout(headerTimer);
-    }
-
-    res.status(upstream.status);
-
-    // Forward headers relevant for seekable playback.
-    const forward = [
-        'content-type',
-        'content-length',
-        'content-range',
-        'accept-ranges',
-        'last-modified',
-        'etag'
-    ];
-    for (const h of forward) {
-        const v = upstream.headers.get(h);
-        if (v) res.setHeader(h, v);
-    }
-    if (!upstream.headers.get('accept-ranges')) {
-        res.setHeader('Accept-Ranges', 'bytes');
-    }
-    res.setHeader('Cache-Control', 'no-store');
-
-    if (req.method === 'HEAD' || !upstream.body) {
-        return res.end();
-    }
-
-    const nodeStream = Readable.fromWeb(upstream.body);
-    res.on('error', () => abort());
-    res.on('close', () => {
-        abort();
-        nodeStream.destroy();
-    });
-    pipeline(nodeStream, res, (e) => {
-        if (e && !isAbortErr(e)) {
-            console.warn(`[proxy] stream error for ${kind}/${streamId}.${ext}: ${e.message}`);
-        }
-    });
 });
 
 app.get('/', (req, res) => {
@@ -1659,7 +1556,7 @@ server.on('error', (err) => {
 process.on('SIGTERM', () => { console.log('SIGTERM received, shutting down...'); server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { console.log('SIGINT received, shutting down...'); server.close(() => process.exit(0)); });
 process.on('uncaughtException', (err) => {
-    // AbortErrors are expected when a client disconnects mid-stream from the proxy.
+    // AbortErrors are expected when a client disconnects during a request.
     if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
     console.error('Uncaught exception:', err);
 });
