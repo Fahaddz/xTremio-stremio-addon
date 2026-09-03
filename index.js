@@ -14,6 +14,7 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const ADDON_ID = 'org.xtremio.addon';
+const IS_VERCEL = process.env.VERCEL === '1' || Boolean(process.env.VERCEL_ENV);
 const CATEGORY_TIMEOUT_MS = Math.max(15000, Number(process.env.UPSTREAM_CATEGORY_TIMEOUT_MS) || 30000);
 const LIST_TIMEOUT_MS = Math.max(30000, Number(process.env.UPSTREAM_LIST_TIMEOUT_MS) || 120000);
 const LIST_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.UPSTREAM_LIST_CONCURRENCY) || 1));
@@ -1357,14 +1358,16 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             const streamId = id.replace('xtremio_movie_', '');
             const info = await getMovieInfo(cfg, streamId);
             const ext = info?.movie_data?.container_extension || 'mp4';
+            const directUrl = `${serverUrl}/movie/${encodedUsername}/${encodedPassword}/${encodeURIComponent(streamId)}.${ext}`;
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
+            const streamUrl = IS_VERCEL ? directUrl : proxyUrl;
             return res.json({
                 streams: [
                     {
-                        url: proxyUrl,
+                        url: streamUrl,
                         title: '▶ Play',
                         behaviorHints: {
-                            notWebReady: isNotWebReady(proxyUrl, ext),
+                            notWebReady: isNotWebReady(streamUrl, ext),
                             bingeGroup: `xtremio-movie-${ext}`
                         }
                     }
@@ -1393,14 +1396,16 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
                 ext = 'mp4';
             }
 
+            const directUrl = `${serverUrl}/series/${encodedUsername}/${encodedPassword}/${encodeURIComponent(episodeId)}.${ext}`;
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/series/${episodeId}.${ext}`;
+            const streamUrl = IS_VERCEL ? directUrl : proxyUrl;
             return res.json({
                 streams: [
                     {
-                        url: proxyUrl,
+                        url: streamUrl,
                         title: '▶ Play',
                         behaviorHints: {
-                            notWebReady: isNotWebReady(proxyUrl, ext),
+                            notWebReady: isNotWebReady(streamUrl, ext),
                             bingeGroup: `xtremio-series-${seriesId}-${ext}`
                         }
                     }
