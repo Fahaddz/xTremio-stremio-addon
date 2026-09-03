@@ -51,7 +51,9 @@ large provider lists. Vercel instances and in-memory caches are ephemeral, so
 the background refresh timers are best-effort there. Use an external scheduler
 and persistent cache if guaranteed periodic refresh is required.
 Movie, episode, and Live TV playback all use direct provider URLs. The addon
-returns stream links and never relays or stores media bytes.
+returns stream links and never relays or stores media bytes. Any legacy
+`/proxy/...` URL is only redirected (302) to the provider for backward
+compatibility and does not proxy bytes.
 
 ## Cache configuration
 

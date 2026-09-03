@@ -1411,6 +1411,30 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     }
 });
 
+// Legacy proxy URL — no byte relay, just redirect to the provider's
+// direct stream. This keeps old cached stream responses (from before
+// the proxy removal) working while ensuring the addon never proxies
+// media bytes.
+app.all('/:config/proxy/:kind/:file', (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        return res.status(405).end('method not allowed');
+    }
+    const cfg = decodeConfig(req.params.config);
+    if (!cfg) return res.status(401).end('unauthorized');
+
+    const { kind, file } = req.params;
+    if (!['movie', 'series', 'live'].includes(kind)) {
+        return res.status(400).end('bad kind');
+    }
+    const match = /^([^./]+)\.([A-Za-z0-9]+)$/.exec(file);
+    if (!match) return res.status(400).end('bad file');
+    const [, streamId, ext] = match;
+
+    const serverUrl = normalizeUrl(cfg.serverUrl);
+    const directUrl = `${serverUrl}/${kind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${streamId}.${ext}`;
+    return res.redirect(302, directUrl);
+});
+
 app.get('/', (req, res) => {
     const safeAddonName = escapeHtml(DEFAULT_SETTINGS.addonName);
     res.send(`<!DOCTYPE html>
