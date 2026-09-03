@@ -63,6 +63,15 @@ function settingsFromForm(body, fallback = getSettings()) {
     };
 }
 
+function safeGenreName(name) {
+    return String(name || '').replace(/\//g, '∕').replace(/&/g, '＆');
+}
+
+function matchSafeCategory(categories, selected) {
+    if (!selected) return null;
+    return categories.find(c => c.category_name === selected || safeGenreName(c.category_name) === selected) || null;
+}
+
 function appendSearchCatalogs(catalogs, settings) {
     if (settings.enableLiveSearch) {
         catalogs.push({
@@ -129,9 +138,9 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
     if (cfg) {
         try {
             const cats = await getCategories(cfg);
-            const movieGenres = [...new Set(cats.movies.map(c => c.category_name).filter(Boolean))];
-            const seriesGenres = [...new Set(cats.series.map(c => c.category_name).filter(Boolean))];
-            const liveGenres = [...new Set(cats.live.map(c => c.category_name).filter(Boolean))];
+            const movieGenres = [...new Set(cats.movies.map(c => safeGenreName(c.category_name)).filter(Boolean))];
+            const seriesGenres = [...new Set(cats.series.map(c => safeGenreName(c.category_name)).filter(Boolean))];
+            const liveGenres = [...new Set(cats.live.map(c => safeGenreName(c.category_name)).filter(Boolean))];
 
             catalogs.push(
                 {
@@ -648,7 +657,40 @@ sweepTimer.unref();
 function parseExtra(extra) {
     const params = Object.create(null);
     if (!extra) return params;
-    for (const [key, value] of new URLSearchParams(extra)) params[key] = value;
+    const raw = String(extra);
+    // Stremio's ktor-client can send genres like "24/7 ACTION & ADVENTURE VIP"
+    // without encoding "/" and "&". The "&" would be mistaken for a param
+    // separator by URLSearchParams, so handle continuations manually.
+    const parts = raw.split('&');
+    let currentKey = null;
+    for (const part of parts) {
+        if (!part) continue;
+        const eq = part.indexOf('=');
+        if (eq !== -1) {
+            const k = part.slice(0, eq);
+            const v = part.slice(eq + 1);
+            try {
+                const dk = decodeURIComponent(k.replace(/\+/g, ' '));
+                const dv = decodeURIComponent(v.replace(/\+/g, ' '));
+                params[dk] = dv;
+                currentKey = dk;
+            } catch {
+                params[k] = v;
+                currentKey = k;
+            }
+        } else if (currentKey) {
+            try {
+                params[currentKey] += '&' + decodeURIComponent(part.replace(/\+/g, ' '));
+            } catch {
+                params[currentKey] += '&' + part;
+            }
+        }
+    }
+    if (Object.keys(params).length === 0) {
+        try {
+            for (const [k, v] of new URLSearchParams(raw)) params[k] = v;
+        } catch {}
+    }
     return params;
 }
 
@@ -1061,8 +1103,8 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
     try {
         if (id === 'xtremio_live') {
             const cats = await getCategories(cfg);
-            const selectedGenre = genre || (cats.live[0] && cats.live[0].category_name);
-            const cat = cats.live.find(c => c.category_name === selectedGenre);
+            const selectedGenre = genre || safeGenreName(cats.live[0] && cats.live[0].category_name);
+            const cat = matchSafeCategory(cats.live, selectedGenre);
             const categoryId = cat && cat.category_id;
 
             // No genre selected and none resolvable -> nothing to show.
@@ -1092,8 +1134,8 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
 
         if (id.startsWith('xtremio_movies_')) {
             const cats = await getCategories(cfg);
-            const selectedGenre = genre || (cats.movies[0] && cats.movies[0].category_name);
-            const cat = cats.movies.find(c => c.category_name === selectedGenre);
+            const selectedGenre = genre || safeGenreName(cats.movies[0] && cats.movies[0].category_name);
+            const cat = matchSafeCategory(cats.movies, selectedGenre);
             if (!cat) return res.json({ metas: [] });
 
             // Category browsing uses a small per-category snapshot. The full
@@ -1125,8 +1167,8 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
 
         if (id.startsWith('xtremio_series_')) {
             const cats = await getCategories(cfg);
-            const selectedGenre = genre || (cats.series[0] && cats.series[0].category_name);
-            const cat = cats.series.find(c => c.category_name === selectedGenre);
+            const selectedGenre = genre || safeGenreName(cats.series[0] && cats.series[0].category_name);
+            const cat = matchSafeCategory(cats.series, selectedGenre);
             if (!cat) return res.json({ metas: [] });
 
             // Category browsing uses a small per-category snapshot. The full
