@@ -25,6 +25,7 @@ Optimized self-hosted Stremio addon for Xtream Codes.
 - Lightweight Node 22 Alpine container.
 - Non-root, read-only container with dropped capabilities.
 - Defensive category filtering when providers return mixed or incomplete category data.
+- Optional addon name, category labels, and a Live TV search toggle.
 
 ## Run
 
@@ -42,6 +43,14 @@ http://YOUR_SERVER_IP:3005/configure
 
 For a direct Node.js deployment, run `npm ci --omit=dev && npm start`.
 
+## Vercel
+
+The root `index.js` is supported by Vercel's zero-configuration Express runtime.
+`vercel.json` allows catalog requests up to five minutes, which is useful for
+large provider lists. Vercel instances and in-memory caches are ephemeral, so
+the background refresh timers are best-effort there. Use an external scheduler
+and persistent cache if guaranteed periodic refresh is required.
+
 ## Cache configuration
 
 | Variable | Default | Purpose |
@@ -56,6 +65,21 @@ For a direct Node.js deployment, run `npm ci --omit=dev && npm start`.
 | `UPSTREAM_BACKGROUND_REFRESH_MS` | `7200000` | Refresh interval for used full snapshots |
 | `UPSTREAM_CATEGORY_REFRESH_MS` | `21600000` | Refresh interval for used category snapshots |
 | `UPSTREAM_SERIES_INFO_REFRESH_MS` | `21600000` | Refresh interval for cached series metadata |
+
+## Customization
+
+Open `/configure` and set the options directly in the web form:
+
+- Addon name
+- Live TV category name
+- Movies category name
+- Series category name
+- Include or exclude Live TV from global search
+
+These settings are stored in the generated Stremio install URL, so different
+users can choose different names. The internal IDs and the original catalog
+structure remain unchanged. Live TV search is off by default and adds only a
+search entry when enabled.
 
 The caches use stale-while-revalidate. Complete responses can be served stale while
 one background refresh runs; incomplete category and metadata responses are not retained.

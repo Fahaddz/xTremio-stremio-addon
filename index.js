@@ -21,9 +21,76 @@ const LIST_CACHE_TTL_MS = Math.max(1000, Number(process.env.UPSTREAM_LIST_TTL_MS
 const BACKGROUND_REFRESH_MS = Math.max(1000, Number(process.env.UPSTREAM_BACKGROUND_REFRESH_MS) || 2 * 60 * 60 * 1000);
 const CATEGORY_REFRESH_MS = Math.max(1000, Number(process.env.UPSTREAM_CATEGORY_REFRESH_MS) || 6 * 60 * 60 * 1000);
 const SERIES_INFO_REFRESH_MS = Math.max(1000, Number(process.env.UPSTREAM_SERIES_INFO_REFRESH_MS) || 6 * 60 * 60 * 1000);
-const FULL_LIST_STALE_MS = process.env.UPSTREAM_LIST_STALE_MS?.toLowerCase() === 'infinite'
+const configuredListStale = process.env.UPSTREAM_LIST_STALE_MS;
+const FULL_LIST_STALE_MS = !configuredListStale || configuredListStale.toLowerCase() === 'infinite'
     ? Infinity
-    : Math.max(LIST_CACHE_TTL_MS, 2 * 60 * 60 * 1000, Number(process.env.UPSTREAM_LIST_STALE_MS) || 7 * 24 * 60 * 60 * 1000);
+    : Math.max(LIST_CACHE_TTL_MS, 2 * 60 * 60 * 1000, Number(configuredListStale) || 7 * 24 * 60 * 60 * 1000);
+
+const DEFAULT_SETTINGS = Object.freeze({
+    addonName: 'xTremio',
+    liveCategoryName: 'Live TV',
+    moviesCategoryName: 'XT-Movies',
+    seriesCategoryName: 'XT-Series',
+    enableLiveSearch: false
+});
+
+function settingName(value, fallback) {
+    const name = String(value || '').trim();
+    return (name || fallback).slice(0, 80);
+}
+
+function settingBoolean(value) {
+    return value === true || /^(1|true|yes|on)$/i.test(String(value || ''));
+}
+
+function getSettings(cfg) {
+    const settings = cfg?.settings && typeof cfg.settings === 'object' ? cfg.settings : cfg || {};
+    return {
+        addonName: settingName(settings.addonName, DEFAULT_SETTINGS.addonName),
+        liveCategoryName: settingName(settings.liveCategoryName, DEFAULT_SETTINGS.liveCategoryName),
+        moviesCategoryName: settingName(settings.moviesCategoryName, DEFAULT_SETTINGS.moviesCategoryName),
+        seriesCategoryName: settingName(settings.seriesCategoryName, DEFAULT_SETTINGS.seriesCategoryName),
+        enableLiveSearch: settingBoolean(settings.enableLiveSearch)
+    };
+}
+
+function settingsFromForm(body, fallback = getSettings()) {
+    return {
+        addonName: settingName(body?.addonName, fallback.addonName),
+        liveCategoryName: settingName(body?.liveCategoryName, fallback.liveCategoryName),
+        moviesCategoryName: settingName(body?.moviesCategoryName, fallback.moviesCategoryName),
+        seriesCategoryName: settingName(body?.seriesCategoryName, fallback.seriesCategoryName),
+        enableLiveSearch: settingBoolean(body?.enableLiveSearch)
+    };
+}
+
+function appendSearchCatalogs(catalogs, settings) {
+    if (settings.enableLiveSearch) {
+        catalogs.push({
+            type: settings.liveCategoryName,
+            id: 'xtremio_search_live',
+            name: 'Search Live TV',
+            extra: [{ name: 'search', isRequired: true }],
+            searchProperties: ['name']
+        });
+    }
+    catalogs.push(
+        {
+            type: settings.moviesCategoryName,
+            id: 'xtremio_search_movies',
+            name: 'Search Movies',
+            extra: [{ name: 'search', isRequired: true }],
+            searchProperties: ['name']
+        },
+        {
+            type: settings.seriesCategoryName,
+            id: 'xtremio_search_series',
+            name: 'Search Series',
+            extra: [{ name: 'search', isRequired: true }],
+            searchProperties: ['name']
+        }
+    );
+}
 
 function getBaseUrl(req) {
     const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
@@ -35,11 +102,12 @@ function escapeHtml(str) {
     return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
-function encodeConfig(cfg) {
+function encodeConfig(cfg, settings = getSettings(cfg)) {
     return Buffer.from(JSON.stringify({
         serverUrl: cfg.serverUrl,
         username: cfg.username,
-        password: cfg.password
+        password: cfg.password,
+        settings: getSettings(settings)
     })).toString('base64url');
 }
 
@@ -57,6 +125,7 @@ function decodeConfig(encoded) {
 
 async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
     const catalogs = [];
+    const settings = getSettings(cfg);
 
     if (cfg) {
         try {
@@ -67,9 +136,9 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 
             catalogs.push(
                 {
-                    type: 'Live TV',
+                    type: settings.liveCategoryName,
                     id: 'xtremio_live',
-                    name: 'Live TV',
+                    name: settings.liveCategoryName,
                     extra: [
                         { name: 'genre', options: liveGenres, isRequired: true },
                         { name: 'skip' },
@@ -77,7 +146,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     ]
                 },
                 {
-                    type: 'XT-Movies',
+                    type: settings.moviesCategoryName,
                     id: 'xtremio_movies_popular',
                     name: 'Popular',
                     extra: [
@@ -87,7 +156,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     ]
                 },
                 {
-                    type: 'XT-Movies',
+                    type: settings.moviesCategoryName,
                     id: 'xtremio_movies_new',
                     name: 'New',
                     extra: [
@@ -97,7 +166,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     ]
                 },
                 {
-                    type: 'XT-Movies',
+                    type: settings.moviesCategoryName,
                     id: 'xtremio_movies_featured',
                     name: 'Featured',
                     extra: [
@@ -107,7 +176,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     ]
                 },
                 {
-                    type: 'XT-Series',
+                    type: settings.seriesCategoryName,
                     id: 'xtremio_series_popular',
                     name: 'Popular',
                     extra: [
@@ -117,7 +186,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     ]
                 },
                 {
-                    type: 'XT-Series',
+                    type: settings.seriesCategoryName,
                     id: 'xtremio_series_new',
                     name: 'New',
                     extra: [
@@ -127,7 +196,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     ]
                 },
                 {
-                    type: 'XT-Series',
+                    type: settings.seriesCategoryName,
                     id: 'xtremio_series_featured',
                     name: 'Featured',
                     extra: [
@@ -135,44 +204,30 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                         { name: 'skip' },
                         { name: 'search' }
                     ]
-                },
-                {
-                    type: 'XT-Movies',
-                    id: 'xtremio_search_movies',
-                    name: 'Search Movies',
-                    extra: [{ name: 'search', isRequired: true }],
-                    searchProperties: ['name']
-                },
-                {
-                    type: 'XT-Series',
-                    id: 'xtremio_search_series',
-                    name: 'Search Series',
-                    extra: [{ name: 'search', isRequired: true }],
-                    searchProperties: ['name']
                 }
             );
+            appendSearchCatalogs(catalogs, settings);
         } catch (e) {
             catalogs.push(
-                { type: 'Live TV', id: 'xtremio_live', name: 'Live TV' },
-                { type: 'XT-Movies', id: 'xtremio_movies_popular', name: 'Popular' },
-                { type: 'XT-Movies', id: 'xtremio_movies_new', name: 'New' },
-                { type: 'XT-Movies', id: 'xtremio_movies_featured', name: 'Featured' },
-                { type: 'XT-Series', id: 'xtremio_series_popular', name: 'Popular' },
-                { type: 'XT-Series', id: 'xtremio_series_new', name: 'New' },
-                { type: 'XT-Series', id: 'xtremio_series_featured', name: 'Featured' },
-                { type: 'XT-Movies', id: 'xtremio_search_movies', name: 'Search Movies', extra: [{ name: 'search', isRequired: true }], searchProperties: ['name'] },
-                { type: 'XT-Series', id: 'xtremio_search_series', name: 'Search Series', extra: [{ name: 'search', isRequired: true }], searchProperties: ['name'] }
+                { type: settings.liveCategoryName, id: 'xtremio_live', name: settings.liveCategoryName },
+                { type: settings.moviesCategoryName, id: 'xtremio_movies_popular', name: 'Popular' },
+                { type: settings.moviesCategoryName, id: 'xtremio_movies_new', name: 'New' },
+                { type: settings.moviesCategoryName, id: 'xtremio_movies_featured', name: 'Featured' },
+                { type: settings.seriesCategoryName, id: 'xtremio_series_popular', name: 'Popular' },
+                { type: settings.seriesCategoryName, id: 'xtremio_series_new', name: 'New' },
+                { type: settings.seriesCategoryName, id: 'xtremio_series_featured', name: 'Featured' }
             );
+            appendSearchCatalogs(catalogs, settings);
         }
     }
 
     return {
         id: ADDON_ID,
         version: '1.1.1',
-        name: 'xTremio',
-        description: 'xTremio addon for Stremio',
+        name: settings.addonName,
+        description: `${settings.addonName} addon for Stremio`,
         resources: ['catalog', 'meta', 'stream'],
-        types: ['Live TV', 'XT-Movies', 'XT-Series', 'series'],
+        types: [...new Set([settings.liveCategoryName, settings.moviesCategoryName, settings.seriesCategoryName, 'series'])],
         catalogs,
         idPrefixes: ['xtremio_live_', 'xtremio_movie_', 'xtremio_series_', 'xtremio_episode_'],
         behaviorHints: {
@@ -770,14 +825,20 @@ async function validateXtremioCredentials(serverUrl, username, password) {
     return { valid: false, error: 'Cannot connect to server' };
 }
 
-function renderConfigPage({ serverUrl = '', username = '', password = '', status = null, baseUrl = `http://localhost:${PORT}` }) {
+function renderConfigPage({ serverUrl = '', username = '', password = '', status = null, baseUrl = `http://localhost:${PORT}`, settings = DEFAULT_SETTINGS }) {
+    const currentSettings = getSettings(settings);
+    const safeAddonName = escapeHtml(currentSettings.addonName);
     const safeServerUrl = escapeHtml(serverUrl);
     const safeUsername = escapeHtml(username);
     const safePassword = escapeHtml(password);
+    const safeLiveCategoryName = escapeHtml(currentSettings.liveCategoryName);
+    const safeMoviesCategoryName = escapeHtml(currentSettings.moviesCategoryName);
+    const safeSeriesCategoryName = escapeHtml(currentSettings.seriesCategoryName);
+    const liveSearchChecked = currentSettings.enableLiveSearch ? ' checked' : '';
     let statusHtml = '';
     if (status) {
         if (status.valid) {
-            const encoded = encodeConfig({ serverUrl, username, password });
+            const encoded = encodeConfig({ serverUrl, username, password }, currentSettings);
             const installUrl = `stremio://${baseUrl.replace(/^https?:\/\//, '')}/${encoded}/manifest.json`;
             const httpUrl = `${baseUrl}/${encoded}/manifest.json`;
             const safeInstallUrl = escapeHtml(installUrl);
@@ -810,7 +871,7 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
 
     return `<!DOCTYPE html>
     <html><head>
-        <title>xTremio Configuration</title>
+        <title>${safeAddonName} Configuration</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -850,8 +911,15 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
             .input-wrapper input { width: 100%; padding: 14px 14px 14px 44px; border: 2px solid #e0e0e0; border-radius: 10px; font-size: 15px; transition: border-color 0.2s, box-shadow 0.2s; }
             .input-wrapper input:focus { outline: none; border-color: #7c4dff; box-shadow: 0 0 0 3px rgba(124,77,255,0.1); }
             .input-wrapper input::placeholder { color: #aaa; }
-            .btn.full { width: 100%; justify-content: center; }
-            .status-section { padding: 0 30px 30px; text-align: center; }
+             .btn.full { width: 100%; justify-content: center; }
+             .customization { border-top: 1px solid #eee; margin-top: 8px; padding-top: 20px; }
+             .customization h2 { color: #333; font-size: 15px; margin-bottom: 14px; }
+             .customization .input-group { margin-bottom: 14px; }
+             .customization input[type="text"] { width: 100%; padding: 11px 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 14px; }
+             .customization input[type="text"]:focus { outline: none; border-color: #7c4dff; }
+             .checkbox-label { display: flex; align-items: center; gap: 9px; color: #444; font-size: 13px; cursor: pointer; }
+             .checkbox-label input { width: 16px; height: 16px; accent-color: #7c4dff; }
+             .status-section { padding: 0 30px 30px; text-align: center; }
             .status-banner { padding: 16px; border-radius: 10px; display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
             .status-banner svg { width: 22px; height: 22px; flex-shrink: 0; }
             .status-banner .status-text { font-size: 14px; font-weight: 500; text-align: left; }
@@ -875,7 +943,7 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
     </head><body>
         <div class="card">
             <div class="header">
-                <h1>xTremio Addon</h1>
+                <h1>${safeAddonName} Addon</h1>
                 <p>Configure your credentials</p>
             </div>
             <div class="form-container">
@@ -903,14 +971,37 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
                             <input type="text" name="username" value="${safeUsername}" placeholder="Enter username" required />
                         </div>
                     </div>
-                    <div class="input-group">
-                        <label>Password</label>
+                     <div class="input-group">
+                         <label>Password</label>
                         <div class="input-wrapper">
                             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
                             <input type="password" name="password" value="${safePassword}" placeholder="Enter password" required />
-                        </div>
-                    </div>
-                    <button type="submit" class="btn full">Save & Install</button>
+                         </div>
+                     </div>
+                     <div class="customization">
+                         <h2>Customize this addon</h2>
+                         <div class="input-group">
+                             <label>Addon name</label>
+                             <input type="text" name="addonName" value="${escapeHtml(currentSettings.addonName)}" maxlength="80" placeholder="xTremio" />
+                         </div>
+                         <div class="input-group">
+                             <label>Live TV category name</label>
+                             <input type="text" name="liveCategoryName" value="${safeLiveCategoryName}" maxlength="80" placeholder="Live TV" />
+                         </div>
+                         <div class="input-group">
+                             <label>Movies category name</label>
+                             <input type="text" name="moviesCategoryName" value="${safeMoviesCategoryName}" maxlength="80" placeholder="XT-Movies" />
+                         </div>
+                         <div class="input-group">
+                             <label>Series category name</label>
+                             <input type="text" name="seriesCategoryName" value="${safeSeriesCategoryName}" maxlength="80" placeholder="XT-Series" />
+                         </div>
+                         <label class="checkbox-label">
+                             <input type="checkbox" name="enableLiveSearch" value="true"${liveSearchChecked} />
+                             Include Live TV in global search
+                         </label>
+                     </div>
+                     <button type="submit" class="btn full">Save & Install</button>
                 </form>
             </div>
             ${statusHtml}
@@ -924,6 +1015,7 @@ app.get('/configure', (req, res) => {
         serverUrl: req.query.serverUrl || existing.serverUrl || '',
         username: req.query.username || existing.username || '',
         password: req.query.password || existing.password || '',
+        settings: getSettings(existing),
         baseUrl: getBaseUrl(req)
     }));
 });
@@ -932,6 +1024,7 @@ app.post('/configure', async (req, res) => {
     const rawServerUrl = (req.body.serverUrl || '').trim().replace(/\/+$/, '');
     const username = req.body.username || '';
     const password = req.body.password || '';
+    const settings = settingsFromForm(req.body);
 
     try {
         const validation = await validateXtremioCredentials(rawServerUrl, username, password);
@@ -943,6 +1036,7 @@ app.post('/configure', async (req, res) => {
             serverUrl: finalServerUrl,
             username,
             password,
+            settings,
             status: validation,
             baseUrl: getBaseUrl(req)
         }));
@@ -951,6 +1045,7 @@ app.post('/configure', async (req, res) => {
             serverUrl: rawServerUrl,
             username,
             password,
+            settings,
             status: { valid: false, error: 'Something went wrong. Please try again.' },
             baseUrl: getBaseUrl(req)
         }));
@@ -960,6 +1055,7 @@ app.post('/configure', async (req, res) => {
 app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.json'], async (req, res) => {
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ metas: [] });
+    const settings = getSettings(cfg);
 
     const { id } = req.params;
     const extra = parseExtra(req.params.extra);
@@ -970,11 +1066,8 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
         if (id === 'xtremio_live') {
             const cats = await getCategories(cfg);
             const selectedGenre = genre || (cats.live[0] && cats.live[0].category_name);
-            let categoryId;
-            if (selectedGenre) {
-                const cat = cats.live.find(c => c.category_name === selectedGenre);
-                if (cat) categoryId = cat.category_id;
-            }
+            const cat = cats.live.find(c => c.category_name === selectedGenre);
+            const categoryId = cat && cat.category_id;
 
             // No genre selected and none resolvable -> nothing to show.
             if (!categoryId) return res.json({ metas: [] });
@@ -982,7 +1075,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             // Fetch only the selected category. This avoids retaining the entire
             // live-TV library in RAM just to render one page.
             let items = await getCategoryStreams(cfg, 'live', categoryId);
-            items = filterCategoryItems(items, categoryId, selectedGenre);
+            items = filterCategoryItems(items, categoryId, cat.category_name);
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
@@ -992,7 +1085,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             const page = items.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
                 id: `xtremio_live_${s.stream_id}`,
-                type: 'Live TV',
+                type: settings.liveCategoryName,
                 name: s.name,
                 poster: s.stream_icon || undefined,
                 posterShape: 'square'
@@ -1010,7 +1103,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             // Category browsing uses a small per-category snapshot. The full
             // library is fetched only when global search actually needs it.
             let items = await getCategoryStreams(cfg, 'movie', cat.category_id);
-            items = filterCategoryItems(items, cat.category_id, selectedGenre);
+            items = filterCategoryItems(items, cat.category_id, cat.category_name);
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
@@ -1025,7 +1118,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             const page = items.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
                 id: `xtremio_movie_${s.stream_id}`,
-                type: 'XT-Movies',
+                type: settings.moviesCategoryName,
                 name: s.name,
                 poster: s.stream_icon || undefined,
                 posterShape: 'poster'
@@ -1043,7 +1136,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             // Category browsing uses a small per-category snapshot. The full
             // library is fetched only when global search actually needs it.
             let items = await getCategoryStreams(cfg, 'series', cat.category_id);
-            items = filterCategoryItems(items, cat.category_id, selectedGenre);
+            items = filterCategoryItems(items, cat.category_id, cat.category_name);
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
@@ -1068,6 +1161,21 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
         }
 
         // Global search catalogs - fetch all streams once, filter in memory
+        if (id === 'xtremio_search_live' && extra.search) {
+            const q = extra.search.toLowerCase();
+            const allLive = await getAllLiveStreams(cfg);
+            const filtered = allLive.filter(s => s.name?.toLowerCase().includes(q));
+            const page = filtered.slice(skip, skip + PAGE_SIZE);
+            const metas = page.map(s => ({
+                id: `xtremio_live_${s.stream_id}`,
+                type: settings.liveCategoryName,
+                name: s.name,
+                poster: s.stream_icon || undefined,
+                posterShape: 'square'
+            }));
+            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
+        }
+
         if (id === 'xtremio_search_movies' && extra.search) {
             const q = extra.search.toLowerCase();
             const allMovies = await getAllVodStreams(cfg);
@@ -1075,7 +1183,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             const page = filtered.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
                 id: `xtremio_movie_${s.stream_id}`,
-                type: 'XT-Movies',
+                type: settings.moviesCategoryName,
                 name: s.name,
                 poster: s.stream_icon || undefined,
                 posterShape: 'poster'
@@ -1108,6 +1216,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
 app.get('/:config/meta/:type/:id.json', async (req, res) => {
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ meta: null });
+    const settings = getSettings(cfg);
     const { id, type } = req.params;
 
     try {
@@ -1119,7 +1228,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
             if (!s) return res.json({ meta: null });
             const meta = {
                 id: `xtremio_live_${s.stream_id}`,
-                type: 'Live TV',
+                type: settings.liveCategoryName,
                 name: s.name,
                 poster: s.stream_icon || undefined,
                 posterShape: 'square',
@@ -1138,7 +1247,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
 
             const meta = {
                 id: `xtremio_movie_${streamId}`,
-                type: 'XT-Movies',
+                type: settings.moviesCategoryName,
                 name: movie.name || movie.o_name || 'Unknown',
                 poster: movie.cover_big || movie.movie_image || undefined,
                 posterShape: 'poster',
@@ -1401,11 +1510,12 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
+    const safeAddonName = escapeHtml(DEFAULT_SETTINGS.addonName);
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>xTremio &mdash; Stremio Addon</title>
+    <title>${safeAddonName} &mdash; Stremio Addon</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="Stremio addon that exposes any Xtream Codes IPTV provider as Live TV, Movies and Series.">
     <style>
@@ -1491,7 +1601,7 @@ app.get('/', (req, res) => {
         <div class="logo">
             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
         </div>
-        <h1>xTremio</h1>
+        <h1>${safeAddonName}</h1>
         <p class="tagline">A Stremio addon that turns your Xtream Codes IPTV provider into browseable Live TV, Movies, and Series catalogs.</p>
 
         <div class="features">
