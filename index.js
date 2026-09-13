@@ -281,7 +281,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 
     return {
         id: ADDON_ID,
-        version: '1.2.0',
+        version: '1.3.0',
         name: settings.addonName,
         description: `${settings.addonName} addon for Stremio`,
         resources: ['catalog', 'meta', 'stream'],
@@ -807,13 +807,56 @@ function searchTokens(query) {
     return [...new Set(normalized.split(/[^\p{L}\p{N}]+/u).filter(Boolean))];
 }
 
+// Live lists are peppered with section separators wrapped in hashes, added by
+// the provider so its own app can group channels ("##### BEIN SPORTS FHD #####").
+// They are not real channels: exclude them from every live list and search.
+const LIVE_SECTION_HEADER_RE = /#{3,}/;
+function isLiveSectionHeader(name) {
+    return LIVE_SECTION_HEADER_RE.test(String(name || ''));
+}
+
+// A name also gets a compacted form (letters and digits only) so that queries
+// typed without separators still match: "beinsports" -> "BEIN SPORTS 1".
+function compactSearchText(value) {
+    return normalizeSearchText(value).replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+const WORD_CHAR_RE = /[\p{L}\p{N}]/u;
+
+// True when `token` occurs at the start of any word in `haystack`.
+function hasWordStart(haystack, token) {
+    let idx = haystack.indexOf(token);
+    while (idx !== -1) {
+        if (idx === 0 || !WORD_CHAR_RE.test(haystack[idx - 1])) return true;
+        idx = haystack.indexOf(token, idx + 1);
+    }
+    return false;
+}
+
+// Results are ordered by relevance so the obvious channels come first:
+//   1. every query word starts a word in the name  ("bein" -> "BEIN SPORTS 1")
+//   2. other word matches                          ("bein" -> "Otterbein TV")
+//   3. compact matches, query and name with spaces and punctuation removed
+//      ("beinsports" -> "BEIN SPORTS 1")
+// Matching stays exact (no fuzzy or typo matching) - ordering just makes the
+// closest hits show up first. Provider order is kept inside each group.
 function filterBySearch(items, query) {
     const tokens = searchTokens(query);
     if (!tokens.length) return [];
-    return items.filter(item => {
+    const compactQuery = compactSearchText(query);
+    const strong = [];
+    const weak = [];
+    const loose = [];
+    for (const item of items) {
         const haystack = item.search_name ?? normalizeSearchText(item.name);
-        return tokens.every(token => haystack.includes(token));
-    });
+        if (tokens.every(token => haystack.includes(token))) {
+            const wordStart = tokens.every(token => hasWordStart(haystack, token));
+            (wordStart ? strong : weak).push(item);
+        } else if (compactQuery.length >= 3 && item.search_compact && item.search_compact.includes(compactQuery)) {
+            loose.push(item);
+        }
+    }
+    return strong.concat(weak, loose);
 }
 
 const PAGE_SIZE = 100;
@@ -832,6 +875,7 @@ function compactStream(item, kind) {
             stream_id: id,
             name: String(item.name || ''),
             search_name: normalizeSearchText(item.name),
+            search_compact: compactSearchText(item.name),
             stream_icon: item.stream_icon || '',
             category_id: categoryId,
             category_name: categoryName
@@ -843,6 +887,7 @@ function compactStream(item, kind) {
             stream_id: id,
             name: String(item.name || ''),
             search_name: normalizeSearchText(item.name),
+            search_compact: compactSearchText(item.name),
             stream_icon: item.stream_icon || '',
             category_id: categoryId,
             category_name: categoryName,
@@ -855,6 +900,7 @@ function compactStream(item, kind) {
         series_id: item.series_id == null ? '' : String(item.series_id),
         name: String(item.name || ''),
         search_name: normalizeSearchText(item.name),
+        search_compact: compactSearchText(item.name),
         cover: item.cover || '',
         category_id: categoryId,
         category_name: categoryName,
@@ -866,7 +912,11 @@ function compactStream(item, kind) {
 async function getStreams(cfg, action, catParam = '', kind) {
     return streamListSemaphore.run(async () => {
         const data = await xtremioGet(cfg, action, catParam, { timeoutMs: LIST_TIMEOUT_MS });
-        return Array.isArray(data) ? data.map(item => compactStream(item, kind)) : [];
+        let items = Array.isArray(data) ? data.map(item => compactStream(item, kind)) : [];
+        // Drop the provider's hash-wrapped section separators so they never
+        // show up in browsing, search results, or picked categories.
+        if (kind === 'live') items = items.filter(item => !isLiveSectionHeader(item.name));
+        return items;
     });
 }
 

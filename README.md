@@ -70,6 +70,12 @@ compatibility and does not proxy bytes.
 | `UPSTREAM_CATEGORY_REFRESH_MS` | `21600000` | Refresh interval for used category snapshots |
 | `UPSTREAM_SERIES_INFO_REFRESH_MS` | `21600000` | Refresh interval for cached series metadata |
 
+## Search behavior
+
+- Matching is normalized: Arabic spelling variants (أ/إ/آ/ٱ → ا, ة → ه, ى → ي, diacritics, ٠-٩ digits), Latin accents, and word order all work. Every word of the query must appear in the name — matching stays exact (no fuzzy/typo matching).
+- Results are ordered by relevance: names where the query starts a word ("bein" → "BEIN SPORTS 1") come first, then other word matches, then names matched with separators removed ("beinsports" still finds "BEIN SPORTS 1").
+- The provider's hash-wrapped section markers ("##### BEIN SPORTS FHD #####") are never shown — not while browsing, not in search results, not in picked categories.
+
 ## Customization
 
 Open `/configure` and set the options directly in the web form:
