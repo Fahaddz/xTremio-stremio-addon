@@ -231,7 +231,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 
     return {
         id: ADDON_ID,
-        version: '1.1.1',
+        version: '1.1.2',
         name: settings.addonName,
         description: `${settings.addonName} addon for Stremio`,
         resources: ['catalog', 'meta', 'stream'],
@@ -694,6 +694,55 @@ function parseExtra(extra) {
     return params;
 }
 
+// ---------------------------------------------------------------------------
+// Search matching
+// ---------------------------------------------------------------------------
+// Xtream catalogs and users spell Arabic inconsistently (أخي vs اخي,
+// مصطفى vs مصطفي, قصة vs قصه, optional diacritics, tatweel, Arabic-Indic
+// digits). A plain lowercase substring check misses those variants, so both
+// the catalog names and the query are normalized before comparing:
+//   - compatibility-decompose, then drop combining marks (tashkeel, accents)
+//   - fold common letter variants (hamza forms, taa marbuta, alef maqsura)
+//   - collapse Arabic-Indic digits to ASCII and drop tatweel
+// A query then matches when each of its words is found somewhere in the name
+// (tolerant of word order and punctuation) without becoming fuzzy matching.
+// Names are normalized once in compactStream (`search_name`) so global search
+// stays a cheap in-memory scan.
+
+const SEARCH_MARKS_RE = /[\p{M}\u200B-\u200F\u2060-\u2064\uFEFF]/gu;
+
+function normalizeSearchText(value) {
+    return String(value || '')
+        .toLowerCase()
+        .normalize('NFKD')
+        .replace(SEARCH_MARKS_RE, '')
+        .replace(/[\u0622\u0623\u0625\u0671\u0672\u0673]/g, '\u0627') // آ أ إ ٱ ٲ ٳ -> ا
+        .replace(/[\u0626\u0649\u06CC\u06D2]/g, '\u064A')            // ئ ى ی ے -> ي
+        .replace(/\u0624/g, '\u0648')                                 // ؤ -> و
+        .replace(/\u0629/g, '\u0647')                                 // ة -> ه
+        .replace(/\u06A9/g, '\u0643')                                 // ک -> ك
+        .replace(/[\u06BE\u06C1]/g, '\u0647')                         // ھ ہ -> ه
+        .replace(/\u0640/g, '')                                       // tatweel
+        .replace(/[\u0660-\u0669]/g, d => String(d.charCodeAt(0) - 0x0660)) // ٠-٩
+        .replace(/[\u06F0-\u06F9]/g, d => String(d.charCodeAt(0) - 0x06F0)); // ۰-۹
+}
+
+function searchTokens(query) {
+    const normalized = normalizeSearchText(query);
+    if (!normalized) return [];
+    // Split into words; every word must appear somewhere in the name.
+    return [...new Set(normalized.split(/[^\p{L}\p{N}]+/u).filter(Boolean))];
+}
+
+function filterBySearch(items, query) {
+    const tokens = searchTokens(query);
+    if (!tokens.length) return [];
+    return items.filter(item => {
+        const haystack = item.search_name ?? normalizeSearchText(item.name);
+        return tokens.every(token => haystack.includes(token));
+    });
+}
+
 const PAGE_SIZE = 100;
 
 // Catalog responses contain many provider-specific fields that are never
@@ -709,6 +758,7 @@ function compactStream(item, kind) {
         return {
             stream_id: id,
             name: String(item.name || ''),
+            search_name: normalizeSearchText(item.name),
             stream_icon: item.stream_icon || '',
             category_id: categoryId,
             category_name: categoryName
@@ -719,6 +769,7 @@ function compactStream(item, kind) {
         return {
             stream_id: id,
             name: String(item.name || ''),
+            search_name: normalizeSearchText(item.name),
             stream_icon: item.stream_icon || '',
             category_id: categoryId,
             category_name: categoryName,
@@ -730,6 +781,7 @@ function compactStream(item, kind) {
     return {
         series_id: item.series_id == null ? '' : String(item.series_id),
         name: String(item.name || ''),
+        search_name: normalizeSearchText(item.name),
         cover: item.cover || '',
         category_id: categoryId,
         category_name: categoryName,
@@ -1159,8 +1211,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             items = filterCategoryItems(items, categoryId, cat.category_name);
 
             if (extra.search) {
-                const q = extra.search.toLowerCase();
-                items = items.filter(s => s.name?.toLowerCase().includes(q));
+                items = filterBySearch(items, extra.search);
             }
 
             const page = items.slice(skip, skip + PAGE_SIZE);
@@ -1187,8 +1238,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             items = filterCategoryItems(items, cat.category_id, cat.category_name);
 
             if (extra.search) {
-                const q = extra.search.toLowerCase();
-                items = items.filter(s => s.name?.toLowerCase().includes(q));
+                items = filterBySearch(items, extra.search);
             }
 
             const sort = id === 'xtremio_movies_new' ? 'new'
@@ -1220,8 +1270,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             items = filterCategoryItems(items, cat.category_id, cat.category_name);
 
             if (extra.search) {
-                const q = extra.search.toLowerCase();
-                items = items.filter(s => s.name?.toLowerCase().includes(q));
+                items = filterBySearch(items, extra.search);
             }
 
             const sort = id === 'xtremio_series_new' ? 'new'
@@ -1243,9 +1292,8 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
 
         // Global search catalogs - fetch all streams once, filter in memory
         if (id === 'xtremio_search_live' && extra.search) {
-            const q = extra.search.toLowerCase();
             const allLive = await getAllLiveStreams(cfg);
-            const filtered = allLive.filter(s => s.name?.toLowerCase().includes(q));
+            const filtered = filterBySearch(allLive, extra.search);
             const page = filtered.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
                 id: `xtremio_live_${s.stream_id}`,
@@ -1258,9 +1306,8 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
         }
 
         if (id === 'xtremio_search_movies' && extra.search) {
-            const q = extra.search.toLowerCase();
             const allMovies = await getAllVodStreams(cfg);
-            const filtered = allMovies.filter(s => s.name?.toLowerCase().includes(q));
+            const filtered = filterBySearch(allMovies, extra.search);
             const page = filtered.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
                 id: `xtremio_movie_${s.stream_id}`,
@@ -1273,9 +1320,8 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
         }
 
         if (id === 'xtremio_search_series' && extra.search) {
-            const q = extra.search.toLowerCase();
             const allSeries = await getAllSeriesStreams(cfg);
-            const filtered = allSeries.filter(s => s.name?.toLowerCase().includes(q));
+            const filtered = filterBySearch(allSeries, extra.search);
             const page = filtered.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
                 id: `xtremio_series_${s.series_id}`,
