@@ -73,6 +73,7 @@ compatibility and does not proxy bytes.
 ## Search behavior
 
 - Matching is normalized: Arabic spelling variants (أ/إ/آ/ٱ → ا, ة → ه, ى → ي, diacritics, ٠-٩ digits), Latin accents, and word order all work. Every word of the query must appear in the name — matching stays exact (no fuzzy/typo matching).
+- Global search only queries the dedicated Search Movies and Search Series catalogs (plus Search Live TV when the toggle is enabled) — they are listed first, so their results lead the search page. Browsing catalogs and picked home catalogs are never searched.
 - Results are ordered by relevance: names where the query starts a word ("bein" → "BEIN SPORTS 1") come first, then other word matches, then names matched with separators removed ("beinsports" still finds "BEIN SPORTS 1").
 - The provider's hash-wrapped section markers ("##### BEIN SPORTS FHD #####") are never shown — not while browsing, not in search results, not in picked categories.
 

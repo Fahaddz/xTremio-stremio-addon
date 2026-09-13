@@ -96,17 +96,12 @@ function matchSafeCategory(categories, selected) {
     return categories.find(c => c.category_name === selected || safeGenreName(c.category_name) === selected) || null;
 }
 
-function appendSearchCatalogs(catalogs, settings) {
-    if (settings.enableLiveSearch) {
-        catalogs.push({
-            type: settings.liveCategoryName,
-            id: 'xtremio_search_live',
-            name: 'Search Live TV',
-            extra: [{ name: 'search', isRequired: true }],
-            searchProperties: ['name']
-        });
-    }
-    catalogs.push(
+// These are the ONLY searchable catalogs (a `search` extra is what makes
+// Stremio query a catalog from the global search page). They are placed first
+// in the manifest so their results lead the search page - browsing and picked
+// category catalogs are not searched.
+function buildSearchCatalogs(settings) {
+    const searchCatalogs = [
         {
             type: settings.moviesCategoryName,
             id: 'xtremio_search_movies',
@@ -121,7 +116,17 @@ function appendSearchCatalogs(catalogs, settings) {
             extra: [{ name: 'search', isRequired: true }],
             searchProperties: ['name']
         }
-    );
+    ];
+    if (settings.enableLiveSearch) {
+        searchCatalogs.push({
+            type: settings.liveCategoryName,
+            id: 'xtremio_search_live',
+            name: 'Search Live TV',
+            extra: [{ name: 'search', isRequired: true }],
+            searchProperties: ['name']
+        });
+    }
+    return searchCatalogs;
 }
 
 function getBaseUrl(req) {
@@ -166,6 +171,9 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
             const seriesGenres = [...new Set(cats.series.map(c => safeGenreName(c.category_name)).filter(Boolean))];
             const liveGenres = [...new Set(cats.live.map(c => safeGenreName(c.category_name)).filter(Boolean))];
 
+            // Search catalogs first: their results lead Stremio's search page.
+            catalogs.push(...buildSearchCatalogs(settings));
+
             catalogs.push(
                 {
                     type: settings.liveCategoryName,
@@ -173,8 +181,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     name: settings.liveCategoryName,
                     extra: [
                         { name: 'genre', options: liveGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
+                        { name: 'skip' }
                     ]
                 },
                 {
@@ -183,8 +190,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     name: 'Popular',
                     extra: [
                         { name: 'genre', options: movieGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
+                        { name: 'skip' }
                     ]
                 },
                 {
@@ -193,8 +199,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     name: 'New',
                     extra: [
                         { name: 'genre', options: movieGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
+                        { name: 'skip' }
                     ]
                 },
                 {
@@ -203,8 +208,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     name: 'Featured',
                     extra: [
                         { name: 'genre', options: movieGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
+                        { name: 'skip' }
                     ]
                 },
                 {
@@ -213,8 +217,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     name: 'Popular',
                     extra: [
                         { name: 'genre', options: seriesGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
+                        { name: 'skip' }
                     ]
                 },
                 {
@@ -223,8 +226,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     name: 'New',
                     extra: [
                         { name: 'genre', options: seriesGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
+                        { name: 'skip' }
                     ]
                 },
                 {
@@ -233,8 +235,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     name: 'Featured',
                     extra: [
                         { name: 'genre', options: seriesGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
+                        { name: 'skip' }
                     ]
                 }
             );
@@ -258,14 +259,13 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     id: `xtremio_pick_${kindCode}_${catId}`,
                     name,
                     extra: [
-                        { name: 'skip' },
-                        { name: 'search' }
+                        { name: 'skip' }
                     ]
                 });
             }
 
-            appendSearchCatalogs(catalogs, settings);
         } catch (e) {
+            catalogs.push(...buildSearchCatalogs(settings));
             catalogs.push(
                 { type: settings.liveCategoryName, id: 'xtremio_live', name: settings.liveCategoryName },
                 { type: settings.moviesCategoryName, id: 'xtremio_movies_popular', name: 'Popular' },
@@ -275,13 +275,12 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                 { type: settings.seriesCategoryName, id: 'xtremio_series_new', name: 'New' },
                 { type: settings.seriesCategoryName, id: 'xtremio_series_featured', name: 'Featured' }
             );
-            appendSearchCatalogs(catalogs, settings);
         }
     }
 
     return {
         id: ADDON_ID,
-        version: '1.3.1',
+        version: '1.4.0',
         name: settings.addonName,
         description: `${settings.addonName} addon for Stremio`,
         resources: ['catalog', 'meta', 'stream'],
