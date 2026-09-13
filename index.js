@@ -280,7 +280,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 
     return {
         id: ADDON_ID,
-        version: '1.5.0',
+        version: '1.5.1',
         name: settings.addonName,
         description: `${settings.addonName} addon for Stremio`,
         resources: ['catalog', 'meta', 'stream'],
@@ -1825,7 +1825,8 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
 // which players surface as an HTTP 400/500 playback error and the user has to
 // re-click until a working node is drawn. This endpoint resolves the provider
 // redirect up front, probes the assigned node with a tiny read and re-rolls
-// when it is broken, then redirects the player to a verified URL. The addon
+// when it is broken, then redirects the player to a verified URL. Providers
+// that serve streams directly (no redirect) are passed through as-is. The addon
 // never relays media bytes; if anything unexpected happens it falls back to
 // the plain provider URL so playback is never worse than before.
 
@@ -1862,6 +1863,9 @@ async function resolveStreamNode(streamUrl) {
             const location = res.headers.get('location');
             return location ? new URL(location, streamUrl).toString() : null;
         }
+        // Providers that serve streams directly (no node rotation) answer with
+        // 2xx here - hand the original URL back as the final target.
+        if (res.status >= 200 && res.status < 300) return streamUrl;
         return null;
     } catch {
         return null;
@@ -1894,6 +1898,7 @@ async function resolveHealthyStreamUrl(streamUrl, probeTimeoutMs) {
     for (let attempt = 0; attempt < 4 && Date.now() < deadline; attempt++) {
         const nodeUrl = await resolveStreamNode(streamUrl);
         if (!nodeUrl) continue; // main host hiccup - try again
+        if (nodeUrl === streamUrl) return nodeUrl; // provider serves directly - nothing to verify
         const host = streamNodeHost(nodeUrl);
         if (host && host === upstreamHost) continue; // looped back to the main host - no node was assigned
         const lastFail = host ? badStreamNodes.get(host) : undefined;

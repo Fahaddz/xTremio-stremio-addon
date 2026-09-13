@@ -50,8 +50,9 @@ The root `index.js` is supported by Vercel's zero-configuration Express runtime.
 large provider lists. Vercel instances and in-memory caches are ephemeral, so
 the background refresh timers are best-effort there. Use an external scheduler
 and persistent cache if guaranteed periodic refresh is required.
-Movie, episode, and Live TV playback all use direct provider URLs. The addon
-returns stream links and never relays or stores media bytes. Any legacy
+Movie, episode, and Live TV playback go through the addon's resolve endpoint,
+which verifies the provider's stream server before the player opens it (see
+Playback below). The addon never relays or stores media bytes. Any legacy
 `/proxy/...` URL is only redirected (302) to the provider for backward
 compatibility and does not proxy bytes.
 
@@ -79,8 +80,16 @@ compatibility and does not proxy bytes.
 
 ## Playback
 
-- Stream URLs are handed to the player through a resolve endpoint (`/<config>/play/...`): the addon resolves the provider's stream-node assignment up front, probes it with a tiny read and re-rolls when the node is broken (the provider rotates streams across several servers), so playback starts on the first click. If verification is impossible the endpoint falls back to the plain provider URL.
+- Stream URLs are handed to the player through a resolve endpoint (`/<config>/play/...`): the addon resolves the provider's stream-server assignment up front, probes it with a tiny read and re-rolls when the server is broken (providers commonly rotate streams across several servers), so playback starts on the first click. Providers that serve streams directly (no redirect) are passed through as-is. If verification is impossible the endpoint falls back to the plain provider URL.
+- Every play resolves fresh, so providers adding, replacing, or rebalancing their stream servers are absorbed automatically — nothing is cached or hardcoded.
 - The addon never relays media bytes — it resolves and redirects only.
+
+## Provider compatibility
+
+- Works with any Xtream Codes provider — the server URL, username, and password come from your install link, and every API call is built from them. There is nothing provider-specific hardcoded in the addon.
+- Switching providers or moving to a new server address: open the configure page (swap `manifest.json` for `configure` in your install link to prefill everything), enter the new details, and use the new install link. Names, the Live TV search toggle, and picks are carried through the form.
+- The connection check follows the provider's own advertised server (`server_info`) when one is offered, so moved API servers resolve during configuration.
+- Stream servers that change over time need no action: see Playback.
 
 ## Customization
 

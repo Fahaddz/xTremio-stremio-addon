@@ -77,7 +77,7 @@ for (let i = 0; i < 500; i++) LIVE.push(lv('Channel ' + i));
 // ---------------------------------------------------------------------------
 // Mock provider server
 // ---------------------------------------------------------------------------
-const STREAM_SIM = { mode: 'ok', seen: 0, badCount: 0 };
+const STREAM_SIM = { mode: 'ok', seen: 0, badCount: 0, hits: 0 };
 
 const mock = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://mock');
@@ -93,6 +93,12 @@ const mock = http.createServer((req, res) => {
     const sm = /^\/(live|movie|series)\/([^/]+)\/([^/]+)\/(.+)\.([A-Za-z0-9]+)$/.exec(u.pathname);
     if (sm) {
         STREAM_SIM.seen++;
+        STREAM_SIM.hits++;
+        if (STREAM_SIM.mode === 'direct') {
+            // provider serves streams directly, no node redirect at all
+            res.writeHead(200, { 'content-type': 'video/mp2t' });
+            return res.end(Buffer.alloc(4096, 7));
+        }
         const file = sm[4] + '.' + sm[5];
         const bad = STREAM_SIM.mode === 'allbad' || (STREAM_SIM.mode === 'firstbad' && STREAM_SIM.seen <= STREAM_SIM.badCount);
         const location = bad
@@ -463,6 +469,15 @@ async function main() {
     const sm2 = await streamReq('movie', 'xtremio_movie_' + firstMovie.stream_id);
     check(sm2.streams[0].url.includes(`/${CFG}/play/movie/`) && sm2.streams[0].url.endsWith('.mkv'),
         'movie entry routes through the play endpoint');
+
+    await setStreamMode('direct');
+    const hitsBefore = STREAM_SIM.hits;
+    pr = await playProbe('play/live/999003.ts');
+    check(pr.status === 302 && pr.loc.includes('/live/u/p/999003.ts') && !pr.loc.includes('/edge/'),
+        'direct-serving provider passed through (no node games)');
+    check(STREAM_SIM.hits - hitsBefore === 1,
+        `direct stream touched once, no wasted attempts (${STREAM_SIM.hits - hitsBefore})`);
+    await setStreamMode('ok');
 
     console.log('');
     console.log(`=== SUMMARY: ${checks - failures.length}/${checks} checks passed ===`);
