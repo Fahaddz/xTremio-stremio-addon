@@ -280,7 +280,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 
     return {
         id: ADDON_ID,
-        version: '1.4.0',
+        version: '1.5.0',
         name: settings.addonName,
         description: `${settings.addonName} addon for Stremio`,
         resources: ['catalog', 'meta', 'stream'],
@@ -1731,8 +1731,11 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             const streamId = id.replace('xtremio_live_', '');
             // Raw MPEG-TS first (the format the account officially allows and the
             // simplest path through the provider's redirect servers), HLS kept as
-            // a second option. Both point at the same underlying stream.
-            const tsUrl = `${serverUrl}/live/${encodedUsername}/${encodedPassword}/${streamId}.ts`;
+            // a second option. Both point at the same underlying stream. The TS
+            // option goes through /play, which verifies the provider's stream node
+            // assignment first and skips broken nodes; the HLS playlist is served
+            // by the provider's main host directly.
+            const tsUrl = `${getBaseUrl(req)}/${req.params.config}/play/live/${streamId}.ts`;
             const hlsUrl = `${serverUrl}/live/${encodedUsername}/${encodedPassword}/${streamId}.m3u8`;
             return res.json({
                 streams: [
@@ -1755,14 +1758,14 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             const streamId = id.replace('xtremio_movie_', '');
             const info = await getMovieInfo(cfg, streamId);
             const ext = info?.movie_data?.container_extension || 'mp4';
-            const directUrl = `${serverUrl}/movie/${encodedUsername}/${encodedPassword}/${encodeURIComponent(streamId)}.${ext}`;
+            const playUrl = `${getBaseUrl(req)}/${req.params.config}/play/movie/${encodeURIComponent(streamId)}.${ext}`;
             return res.json({
                 streams: [
                     {
-                        url: directUrl,
+                        url: playUrl,
                         title: '▶ Play',
                         behaviorHints: {
-                            notWebReady: isNotWebReady(directUrl, ext),
+                            notWebReady: isNotWebReady(playUrl, ext),
                             bingeGroup: `xtremio-movie-${ext}`
                         }
                     }
@@ -1791,14 +1794,14 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
                 ext = 'mp4';
             }
 
-            const directUrl = `${serverUrl}/series/${encodedUsername}/${encodedPassword}/${encodeURIComponent(episodeId)}.${ext}`;
+            const playUrl = `${getBaseUrl(req)}/${req.params.config}/play/episode/${encodeURIComponent(episodeId)}.${ext}`;
             return res.json({
                 streams: [
                     {
-                        url: directUrl,
+                        url: playUrl,
                         title: '▶ Play',
                         behaviorHints: {
-                            notWebReady: isNotWebReady(directUrl, ext),
+                            notWebReady: isNotWebReady(playUrl, ext),
                             bingeGroup: `xtremio-series-${seriesId}-${ext}`
                         }
                     }
@@ -1810,6 +1813,124 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     } catch (e) {
         console.error('[stream] Error:', e.message);
         res.json({ streams: [] });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Stream node resolution (/play endpoint)
+// ---------------------------------------------------------------------------
+// The provider rotates each stream across a pool of stream nodes via the
+// redirect it hands out. Occasionally a node is broken (observed: answering
+// HTTP 500 "failed to redirect to stream origin", or hanging until timeout),
+// which players surface as an HTTP 400/500 playback error and the user has to
+// re-click until a working node is drawn. This endpoint resolves the provider
+// redirect up front, probes the assigned node with a tiny read and re-rolls
+// when it is broken, then redirects the player to a verified URL. The addon
+// never relays media bytes; if anything unexpected happens it falls back to
+// the plain provider URL so playback is never worse than before.
+
+const BAD_NODE_TTL_MS = 30 * 60 * 1000;
+const badStreamNodes = new Map(); // node host -> last failure timestamp
+
+function streamNodeHost(url) {
+    try {
+        return new URL(url).host;
+    } catch {
+        return '';
+    }
+}
+
+async function fetchWithTimeout(url, { timeoutMs = 8000, headers = {}, redirect = 'follow' } = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { signal: controller.signal, redirect, headers });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function resolveStreamNode(streamUrl) {
+    try {
+        const res = await fetchWithTimeout(streamUrl, {
+            timeoutMs: 8000,
+            redirect: 'manual',
+            headers: { 'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20' }
+        });
+        try { await res.body?.cancel(); } catch {}
+        if (res.status >= 300 && res.status < 400) {
+            const location = res.headers.get('location');
+            return location ? new URL(location, streamUrl).toString() : null;
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+async function probeStreamNode(nodeUrl, timeoutMs) {
+    try {
+        const res = await fetchWithTimeout(nodeUrl, {
+            timeoutMs,
+            headers: { 'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20' }
+        });
+        if (!res.ok && res.status !== 206) {
+            try { await res.body?.cancel(); } catch {}
+            return false;
+        }
+        const reader = res.body && res.body.getReader ? res.body.getReader() : null;
+        if (!reader) return false;
+        const { value, done } = await reader.read();
+        try { await reader.cancel(); } catch {}
+        return !done && Boolean(value && value.length);
+    } catch {
+        return false;
+    }
+}
+
+async function resolveHealthyStreamUrl(streamUrl, probeTimeoutMs) {
+    const upstreamHost = streamNodeHost(streamUrl);
+    const deadline = Date.now() + 10000;
+    for (let attempt = 0; attempt < 4 && Date.now() < deadline; attempt++) {
+        const nodeUrl = await resolveStreamNode(streamUrl);
+        if (!nodeUrl) continue; // main host hiccup - try again
+        const host = streamNodeHost(nodeUrl);
+        if (host && host === upstreamHost) continue; // looped back to the main host - no node was assigned
+        const lastFail = host ? badStreamNodes.get(host) : undefined;
+        if (lastFail !== undefined && Date.now() - lastFail < BAD_NODE_TTL_MS) {
+            continue; // recently broken node - re-roll without probing again
+        }
+        if (await probeStreamNode(nodeUrl, probeTimeoutMs)) return nodeUrl;
+        if (host) {
+            badStreamNodes.set(host, Date.now());
+            for (const [h, ts] of badStreamNodes) {
+                if (Date.now() - ts > BAD_NODE_TTL_MS) badStreamNodes.delete(h);
+            }
+        }
+    }
+    return null;
+}
+
+app.get('/:config/play/:kind/:file', async (req, res) => {
+    const cfg = decodeConfig(req.params.config);
+    if (!cfg) return res.status(401).end('unauthorized');
+
+    const { kind, file } = req.params;
+    if (!['live', 'movie', 'episode'].includes(kind)) return res.status(400).end('bad kind');
+    const match = /^([^./]+)\.([A-Za-z0-9]+)$/.exec(file);
+    if (!match) return res.status(400).end('bad file');
+    const [, streamId, ext] = match;
+
+    const serverUrl = normalizeUrl(cfg.serverUrl);
+    const providerKind = kind === 'episode' ? 'series' : kind;
+    const upstream = `${serverUrl}/${providerKind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${encodeURIComponent(streamId)}.${ext}`;
+
+    res.set('Cache-Control', 'no-store');
+    try {
+        const resolved = await resolveHealthyStreamUrl(upstream, kind === 'live' ? 5000 : 7000);
+        return res.redirect(302, resolved || upstream);
+    } catch {
+        return res.redirect(302, upstream);
     }
 });
 

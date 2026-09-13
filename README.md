@@ -77,6 +77,11 @@ compatibility and does not proxy bytes.
 - Results are ordered by relevance: names where the query starts a word ("bein" → "BEIN SPORTS 1") come first, then other word matches, then names matched with separators removed ("beinsports" still finds "BEIN SPORTS 1").
 - The provider's hash-wrapped section markers ("##### BEIN SPORTS FHD #####") are never shown — not while browsing, not in search results, not in picked categories.
 
+## Playback
+
+- Stream URLs are handed to the player through a resolve endpoint (`/<config>/play/...`): the addon resolves the provider's stream-node assignment up front, probes it with a tiny read and re-rolls when the node is broken (the provider rotates streams across several servers), so playback starts on the first click. If verification is impossible the endpoint falls back to the plain provider URL.
+- The addon never relays media bytes — it resolves and redirects only.
+
 ## Customization
 
 Open `/configure` and set the options directly in the web form:
