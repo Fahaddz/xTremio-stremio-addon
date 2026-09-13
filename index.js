@@ -280,7 +280,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 
     return {
         id: ADDON_ID,
-        version: '1.5.1',
+        version: '1.6.0',
         name: settings.addonName,
         description: `${settings.addonName} addon for Stremio`,
         resources: ['catalog', 'meta', 'stream'],
@@ -1737,6 +1737,9 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             // by the provider's main host directly.
             const tsUrl = `${getBaseUrl(req)}/${req.params.config}/play/live/${streamId}.ts`;
             const hlsUrl = `${serverUrl}/live/${encodedUsername}/${encodedPassword}/${streamId}.m3u8`;
+            // Warm the verification in the background: by the time the user
+            // clicks play, resolve+probe is done and playback starts instantly.
+            warmPlayUrl(buildUpstreamStreamUrl(cfg, 'live', streamId, 'ts'), 5000);
             return res.json({
                 streams: [
                     {
@@ -1759,6 +1762,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             const info = await getMovieInfo(cfg, streamId);
             const ext = info?.movie_data?.container_extension || 'mp4';
             const playUrl = `${getBaseUrl(req)}/${req.params.config}/play/movie/${encodeURIComponent(streamId)}.${ext}`;
+            warmPlayUrl(buildUpstreamStreamUrl(cfg, 'movie', streamId, ext), 7000);
             return res.json({
                 streams: [
                     {
@@ -1795,6 +1799,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             }
 
             const playUrl = `${getBaseUrl(req)}/${req.params.config}/play/episode/${encodeURIComponent(episodeId)}.${ext}`;
+            warmPlayUrl(buildUpstreamStreamUrl(cfg, 'episode', episodeId, ext), 7000);
             return res.json({
                 streams: [
                     {
@@ -1895,17 +1900,26 @@ async function probeStreamNode(nodeUrl, timeoutMs) {
 async function resolveHealthyStreamUrl(streamUrl, probeTimeoutMs) {
     const upstreamHost = streamNodeHost(streamUrl);
     const deadline = Date.now() + 10000;
+    let resolveMs = 0;
+    let probeMs = 0;
+    let attempts = 0;
     for (let attempt = 0; attempt < 4 && Date.now() < deadline; attempt++) {
+        attempts++;
+        const t0 = Date.now();
         const nodeUrl = await resolveStreamNode(streamUrl);
+        resolveMs += Date.now() - t0;
         if (!nodeUrl) continue; // main host hiccup - try again
-        if (nodeUrl === streamUrl) return nodeUrl; // provider serves directly - nothing to verify
+        if (nodeUrl === streamUrl) return { url: nodeUrl, resolveMs, probeMs, attempts }; // serves directly - nothing to verify
         const host = streamNodeHost(nodeUrl);
         if (host && host === upstreamHost) continue; // looped back to the main host - no node was assigned
         const lastFail = host ? badStreamNodes.get(host) : undefined;
         if (lastFail !== undefined && Date.now() - lastFail < BAD_NODE_TTL_MS) {
             continue; // recently broken node - re-roll without probing again
         }
-        if (await probeStreamNode(nodeUrl, probeTimeoutMs)) return nodeUrl;
+        const t1 = Date.now();
+        const ok = await probeStreamNode(nodeUrl, probeTimeoutMs);
+        probeMs += Date.now() - t1;
+        if (ok) return { url: nodeUrl, resolveMs, probeMs, attempts };
         if (host) {
             badStreamNodes.set(host, Date.now());
             for (const [h, ts] of badStreamNodes) {
@@ -1914,6 +1928,58 @@ async function resolveHealthyStreamUrl(streamUrl, probeTimeoutMs) {
         }
     }
     return null;
+}
+
+// Opening a stream costs a resolve + probe. Players commonly touch the same
+// URL more than once (sniff then play, quick reconnects) and the source list
+// is opened moments before the click - so a verified result is briefly reused
+// and can be pre-warmed when the source list is fetched. The TTL is short: an
+// expired entry simply resolves fresh, nothing here weakens the verification
+// that makes first-click playback reliable.
+
+const PLAY_CACHE_TTL_MS = 45 * 1000;
+const playCache = new Map(); // upstream URL -> { url, at }
+const playPending = new Map(); // upstream URL -> one in-flight verification
+
+function rememberPlayUrl(streamUrl, url) {
+    playCache.set(streamUrl, { url, at: Date.now() });
+    if (playCache.size > 300) {
+        const cutoff = Date.now() - PLAY_CACHE_TTL_MS;
+        for (const [key, entry] of playCache) {
+            if (entry.at < cutoff) playCache.delete(key);
+        }
+    }
+}
+
+async function getPlayUrl(streamUrl, probeTimeoutMs) {
+    const now = Date.now();
+    const hit = playCache.get(streamUrl);
+    if (hit && now - hit.at < PLAY_CACHE_TTL_MS) {
+        const host = streamNodeHost(hit.url);
+        const badAt = host ? badStreamNodes.get(host) : undefined;
+        const hostRecentlyBad = badAt !== undefined && now - badAt < BAD_NODE_TTL_MS;
+        if (!hostRecentlyBad) return { url: hit.url, resolveMs: 0, probeMs: 0, attempts: 0, cached: true };
+    }
+    let pending = playPending.get(streamUrl);
+    if (!pending) {
+        pending = resolveHealthyStreamUrl(streamUrl, probeTimeoutMs).finally(() => {
+            if (playPending.get(streamUrl) === pending) playPending.delete(streamUrl);
+        });
+        playPending.set(streamUrl, pending);
+    }
+    const result = await pending;
+    if (result && result.url) rememberPlayUrl(streamUrl, result.url);
+    return result ? { ...result, cached: false } : null;
+}
+
+function warmPlayUrl(streamUrl, probeTimeoutMs) {
+    getPlayUrl(streamUrl, probeTimeoutMs).catch(() => {});
+}
+
+function buildUpstreamStreamUrl(cfg, kind, streamId, ext) {
+    const serverUrl = normalizeUrl(cfg.serverUrl);
+    const providerKind = kind === 'episode' ? 'series' : kind;
+    return `${serverUrl}/${providerKind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${encodeURIComponent(streamId)}.${ext}`;
 }
 
 app.get('/:config/play/:kind/:file', async (req, res) => {
@@ -1926,14 +1992,17 @@ app.get('/:config/play/:kind/:file', async (req, res) => {
     if (!match) return res.status(400).end('bad file');
     const [, streamId, ext] = match;
 
-    const serverUrl = normalizeUrl(cfg.serverUrl);
-    const providerKind = kind === 'episode' ? 'series' : kind;
-    const upstream = `${serverUrl}/${providerKind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${encodeURIComponent(streamId)}.${ext}`;
+    const upstream = buildUpstreamStreamUrl(cfg, kind, streamId, ext);
 
     res.set('Cache-Control', 'no-store');
     try {
-        const resolved = await resolveHealthyStreamUrl(upstream, kind === 'live' ? 5000 : 7000);
-        return res.redirect(302, resolved || upstream);
+        const result = await getPlayUrl(upstream, kind === 'live' ? 5000 : 7000);
+        const target = (result && result.url) || upstream;
+        res.set('X-Xtremio-Cache', result ? (result.cached ? 'hit' : 'miss') : 'fallback');
+        if (result && !result.cached) {
+            res.set('X-Xtremio-Timing', `r=${Math.round(result.resolveMs)}ms p=${Math.round(result.probeMs)}ms a=${result.attempts}`);
+        }
+        return res.redirect(302, target);
     } catch {
         return res.redirect(302, upstream);
     }

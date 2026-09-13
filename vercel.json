@@ -3,5 +3,6 @@
     "index.js": {
       "maxDuration": 300
     }
-  }
+  },
+  "regions": ["cdg1"]
 }

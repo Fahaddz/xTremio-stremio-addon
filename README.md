@@ -81,8 +81,10 @@ compatibility and does not proxy bytes.
 ## Playback
 
 - Stream URLs are handed to the player through a resolve endpoint (`/<config>/play/...`): the addon resolves the provider's stream-server assignment up front, probes it with a tiny read and re-rolls when the server is broken (providers commonly rotate streams across several servers), so playback starts on the first click. Providers that serve streams directly (no redirect) are passed through as-is. If verification is impossible the endpoint falls back to the plain provider URL.
+- Verification is cached briefly (~45s) and pre-warmed when a source list is opened, so the click itself starts instantly and the player's repeated opens (sniff + play, quick reconnects) never re-run the check.
 - Every play resolves fresh, so providers adding, replacing, or rebalancing their stream servers are absorbed automatically — nothing is cached or hardcoded.
 - The addon never relays media bytes — it resolves and redirects only.
+- Functions deploy to Paris (cdg1), close to the provider, so every check and API call stays short.
 
 ## Provider compatibility
 

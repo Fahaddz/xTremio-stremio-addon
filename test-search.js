@@ -444,7 +444,7 @@ async function main() {
     }
     async function playProbe(path) {
         const r = await fetch(`http://127.0.0.1:${APP_PORT}/${CFG}/${path}`, { redirect: 'manual' });
-        return { status: r.status, loc: r.headers.get('location') || '' };
+        return { status: r.status, loc: r.headers.get('location') || '', cache: r.headers.get('x-xtremio-cache') || '' };
     }
     await setStreamMode('firstbad', 1);
     let pr = await playProbe('play/live/999001.ts');
@@ -478,6 +478,26 @@ async function main() {
     check(STREAM_SIM.hits - hitsBefore === 1,
         `direct stream touched once, no wasted attempts (${STREAM_SIM.hits - hitsBefore})`);
     await setStreamMode('ok');
+
+    // fast-start behavior: cache + in-flight de-dup + source-list pre-warm
+    pr = await playProbe('play/live/999030.ts');
+    check(pr.status === 302 && pr.cache === 'miss' && pr.loc.includes('/edge/good-999030.ts'), 'fresh play verifies then serves (cache miss)');
+    const hitsC = STREAM_SIM.hits;
+    const pr2 = await playProbe('play/live/999030.ts');
+    check(pr2.loc === pr.loc && pr2.cache === 'hit' && STREAM_SIM.hits === hitsC, 'verified URL cached: repeat open costs no upstream touch');
+
+    const hitsD = STREAM_SIM.hits;
+    const [pc1, pc2] = await Promise.all([playProbe('play/live/999031.ts'), playProbe('play/live/999031.ts')]);
+    check(pc1.loc === pc2.loc && pc1.loc.includes('/edge/good-999031.ts') && STREAM_SIM.hits - hitsD === 1,
+        'parallel opens share one verification');
+
+    const warmLive = LIVE.find(x => x.name === 'Music #1');
+    const hitsE = STREAM_SIM.hits;
+    await streamReq('live', 'xtremio_live_' + warmLive.stream_id);
+    await new Promise(r => setTimeout(r, 600));
+    check(STREAM_SIM.hits > hitsE, 'opening the source list pre-warms the stream in the background');
+    pr = await playProbe('play/live/' + warmLive.stream_id + '.ts');
+    check(pr.cache === 'hit' && pr.loc.includes('/edge/good-'), 'pre-warmed verification reused on play (instant start)');
 
     console.log('');
     console.log(`=== SUMMARY: ${checks - failures.length}/${checks} checks passed ===`);
