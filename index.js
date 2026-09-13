@@ -281,7 +281,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 
     return {
         id: ADDON_ID,
-        version: '1.3.0',
+        version: '1.3.1',
         name: settings.addonName,
         description: `${settings.addonName} addon for Stremio`,
         resources: ['catalog', 'meta', 'stream'],
@@ -1730,10 +1730,23 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
         // --- Handle xTremio's own IDs ---
         if (id.startsWith('xtremio_live_')) {
             const streamId = id.replace('xtremio_live_', '');
+            // Raw MPEG-TS first (the format the account officially allows and the
+            // simplest path through the provider's redirect servers), HLS kept as
+            // a second option. Both point at the same underlying stream.
+            const tsUrl = `${serverUrl}/live/${encodedUsername}/${encodedPassword}/${streamId}.ts`;
+            const hlsUrl = `${serverUrl}/live/${encodedUsername}/${encodedPassword}/${streamId}.m3u8`;
             return res.json({
                 streams: [
-                    { url: `${serverUrl}/live/${encodedUsername}/${encodedPassword}/${streamId}.m3u8`, title: 'HLS' },
-                    { url: `${serverUrl}/live/${encodedUsername}/${encodedPassword}/${streamId}.ts`, title: 'MPEG-TS' }
+                    {
+                        url: tsUrl,
+                        title: 'MPEG-TS',
+                        behaviorHints: { notWebReady: isNotWebReady(tsUrl, 'ts') }
+                    },
+                    {
+                        url: hlsUrl,
+                        title: 'HLS',
+                        behaviorHints: { notWebReady: isNotWebReady(hlsUrl, 'm3u8') }
+                    }
                 ],
                 cacheMaxAge: 3600
             });
