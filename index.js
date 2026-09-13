@@ -30,7 +30,8 @@ const DEFAULT_SETTINGS = Object.freeze({
     liveCategoryName: 'Live TV',
     moviesCategoryName: 'XT-Movies',
     seriesCategoryName: 'XT-Series',
-    enableLiveSearch: false
+    enableLiveSearch: false,
+    homeCatalogs: []
 });
 
 function settingName(value, fallback) {
@@ -42,6 +43,27 @@ function settingBoolean(value) {
     return value === true || /^(1|true|yes|on)$/i.test(String(value || ''));
 }
 
+// Picked "home" categories are stored in the config URL as compact `kind:id`
+// pairs (m = movies, s = series, l = live) so the install link stays short.
+// Each pick becomes its own Stremio catalog the user can pin and reorder on
+// the home board.
+const MAX_HOME_CATALOGS = 60;
+const HOME_CATALOG_RE = /^[msl]:[A-Za-z0-9_.-]{1,40}$/;
+
+function parseHomeCatalogs(value) {
+    const list = Array.isArray(value) ? value : value == null ? [] : [value];
+    const out = [];
+    const seen = new Set();
+    for (const raw of list) {
+        const item = String(raw || '').trim();
+        if (!HOME_CATALOG_RE.test(item) || seen.has(item)) continue;
+        seen.add(item);
+        out.push(item);
+        if (out.length >= MAX_HOME_CATALOGS) break;
+    }
+    return out;
+}
+
 function getSettings(cfg) {
     const settings = cfg?.settings && typeof cfg.settings === 'object' ? cfg.settings : cfg || {};
     return {
@@ -49,7 +71,8 @@ function getSettings(cfg) {
         liveCategoryName: settingName(settings.liveCategoryName, DEFAULT_SETTINGS.liveCategoryName),
         moviesCategoryName: settingName(settings.moviesCategoryName, DEFAULT_SETTINGS.moviesCategoryName),
         seriesCategoryName: settingName(settings.seriesCategoryName, DEFAULT_SETTINGS.seriesCategoryName),
-        enableLiveSearch: settingBoolean(settings.enableLiveSearch)
+        enableLiveSearch: settingBoolean(settings.enableLiveSearch),
+        homeCatalogs: parseHomeCatalogs(settings.homeCatalogs)
     };
 }
 
@@ -59,7 +82,8 @@ function settingsFromForm(body, fallback = getSettings()) {
         liveCategoryName: settingName(body?.liveCategoryName, fallback.liveCategoryName),
         moviesCategoryName: settingName(body?.moviesCategoryName, fallback.moviesCategoryName),
         seriesCategoryName: settingName(body?.seriesCategoryName, fallback.seriesCategoryName),
-        enableLiveSearch: settingBoolean(body?.enableLiveSearch)
+        enableLiveSearch: settingBoolean(body?.enableLiveSearch),
+        homeCatalogs: parseHomeCatalogs(body?.picks)
     };
 }
 
@@ -214,6 +238,32 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                     ]
                 }
             );
+
+            // Categories picked in the config page become individual catalogs
+            // ("home rails") the user can pin and reorder on the Stremio board.
+            for (const pick of settings.homeCatalogs) {
+                const sep = pick.indexOf(':');
+                const kindCode = pick.slice(0, sep);
+                const catId = pick.slice(sep + 1);
+                const list = kindCode === 'm' ? cats.movies : kindCode === 's' ? cats.series : cats.live;
+                const cat = list.find(c => String(c.category_id == null ? '' : c.category_id) === catId);
+                if (!cat) continue; // category renamed/removed upstream — skip it
+                const name = String(cat.category_name || '').trim();
+                if (!name) continue;
+                const type = kindCode === 'm' ? settings.moviesCategoryName
+                    : kindCode === 's' ? settings.seriesCategoryName
+                        : settings.liveCategoryName;
+                catalogs.push({
+                    type,
+                    id: `xtremio_pick_${kindCode}_${catId}`,
+                    name,
+                    extra: [
+                        { name: 'skip' },
+                        { name: 'search' }
+                    ]
+                });
+            }
+
             appendSearchCatalogs(catalogs, settings);
         } catch (e) {
             catalogs.push(
@@ -231,7 +281,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 
     return {
         id: ADDON_ID,
-        version: '1.1.2',
+        version: '1.2.0',
         name: settings.addonName,
         description: `${settings.addonName} addon for Stremio`,
         resources: ['catalog', 'meta', 'stream'],
@@ -555,6 +605,29 @@ async function getCategories(cfg) {
             complete: results.every(r => r.status === 'fulfilled' && Array.isArray(r.value))
         };
     });
+}
+
+// Loads the provider's categories for the configure page. Returns three
+// lists of { id, name } in provider order, or null when nothing could be
+// loaded (the page then keeps the saved selection instead of showing an
+// empty picker).
+async function loadSelectableCategories(cfg) {
+    try {
+        const cats = await getCategories(cfg);
+        const toItems = list => (Array.isArray(list) ? list : [])
+            .map(c => ({
+                id: c && c.category_id != null ? String(c.category_id) : '',
+                name: String((c && c.category_name) || '').trim()
+            }))
+            .filter(c => c.id && c.name);
+        const movies = toItems(cats.movies);
+        const series = toItems(cats.series);
+        const live = toItems(cats.live);
+        if (!movies.length && !series.length && !live.length) return null;
+        return { movies, series, live };
+    } catch {
+        return null;
+    }
 }
 
 async function getAllVodStreams(cfg) {
@@ -915,7 +988,34 @@ async function validateXtremioCredentials(serverUrl, username, password) {
     return { valid: false, error: 'Cannot connect to server' };
 }
 
-function renderConfigPage({ serverUrl = '', username = '', password = '', status = null, baseUrl = `http://localhost:${PORT}`, settings = DEFAULT_SETTINGS }) {
+function renderCategoryPicker(categories, selected) {
+    const kinds = [
+        ['Movies', 'm', categories.movies],
+        ['Series', 's', categories.series],
+        ['Live', 'l', categories.live]
+    ];
+    return kinds.map(([label, code, list]) => {
+        if (!list || !list.length) return '';
+        const listId = `cat-${code}`;
+        const items = list.map(c => {
+            const value = `${code}:${c.id}`;
+            const checked = selected.has(value) ? ' checked' : '';
+            return `<label><input type="checkbox" name="picks" value="${escapeHtml(value)}"${checked} /> <span>${escapeHtml(c.name)}</span></label>`;
+        }).join('');
+        return `
+                    <details>
+                        <summary>${label} <span class="cat-count">(${list.length})</span></summary>
+                        <div class="cat-tools">
+                            <input type="text" placeholder="Filter ${label.toLowerCase()}…" oninput="catFilter(this, '${listId}')" />
+                            <button type="button" onclick="catAll('${listId}', true)">All</button>
+                            <button type="button" onclick="catAll('${listId}', false)">None</button>
+                        </div>
+                        <div class="cat-list" id="${listId}">${items}</div>
+                    </details>`;
+    }).join('');
+}
+
+function renderConfigPage({ serverUrl = '', username = '', password = '', status = null, baseUrl = `http://localhost:${PORT}`, settings = DEFAULT_SETTINGS, categories = null }) {
     const currentSettings = getSettings(settings);
     const safeAddonName = escapeHtml(currentSettings.addonName);
     const safeServerUrl = escapeHtml(serverUrl);
@@ -925,6 +1025,22 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
     const safeMoviesCategoryName = escapeHtml(currentSettings.moviesCategoryName);
     const safeSeriesCategoryName = escapeHtml(currentSettings.seriesCategoryName);
     const liveSearchChecked = currentSettings.enableLiveSearch ? ' checked' : '';
+    const selectedPicks = new Set(currentSettings.homeCatalogs);
+    const catalogsHtml = categories
+        ? `
+                    <div class="catalog-picker">
+                        <h2>Home screen catalogs</h2>
+                        <p class="cat-hint">Pick provider categories to expose as separate catalogs. Each selected category shows up on the Stremio / Nuvio board, where you can pin and reorder it. Selected: <b>${currentSettings.homeCatalogs.length}</b>.</p>
+                        ${renderCategoryPicker(categories, selectedPicks)}
+                    </div>`
+        : `
+                    <div class="catalog-picker">
+                        <h2>Home screen catalogs</h2>
+                        <p class="cat-hint">${(serverUrl && username && password)
+                            ? `Categories couldn't be loaded right now — save again to retry.${currentSettings.homeCatalogs.length ? ` Current selection is kept (${currentSettings.homeCatalogs.length}).` : ''}`
+                            : 'Want categories as separate home catalogs? Save your credentials first — the category list loads after a successful save.'}</p>
+                        ${currentSettings.homeCatalogs.map(v => `<input type="hidden" name="picks" value="${escapeHtml(v)}" />`).join('')}
+                    </div>`;
     let statusHtml = '';
     if (status) {
         if (status.valid) {
@@ -1029,6 +1145,19 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
             .disclaimer strong { color: #ef6c00; display: block; margin-bottom: 4px; font-size: 13px; }
             .disclaimer ul { margin: 6px 0 0 18px; padding: 0; }
             .disclaimer li { margin-bottom: 3px; }
+            .catalog-picker { border-top: 1px solid #eee; margin-top: 18px; padding-top: 20px; }
+            .catalog-picker h2 { color: #333; font-size: 15px; margin-bottom: 6px; }
+            .catalog-picker .cat-hint { font-size: 12px; color: #777; line-height: 1.5; margin-bottom: 12px; }
+            .catalog-picker details { border: 1px solid #eee; border-radius: 8px; margin-bottom: 8px; padding: 8px 10px; }
+            .catalog-picker summary { cursor: pointer; font-size: 13px; font-weight: 600; color: #444; }
+            .catalog-picker .cat-count { color: #999; font-weight: 400; }
+            .catalog-picker .cat-tools { display: flex; gap: 6px; margin: 8px 0; }
+            .catalog-picker .cat-tools input { flex: 1; min-width: 0; padding: 7px 9px; border: 1px solid #e0e0e0; border-radius: 6px; font-size: 12px; }
+            .catalog-picker .cat-tools button { padding: 6px 10px; border: 1px solid #ddd; background: #fafafa; border-radius: 6px; font-size: 12px; cursor: pointer; }
+            .catalog-picker .cat-list { max-height: 220px; overflow: auto; border-top: 1px dashed #eee; }
+            .catalog-picker .cat-list label { display: flex; align-items: center; gap: 8px; padding: 5px 2px; border-bottom: 1px solid #f6f6f6; font-size: 12.5px; color: #333; cursor: pointer; }
+            .catalog-picker .cat-list label:hover { background: #faf8ff; }
+            .catalog-picker .cat-list input { width: 15px; height: 15px; accent-color: #7c4dff; flex: none; }
         </style>
     </head><body>
         <div class="card">
@@ -1090,22 +1219,43 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
                              <input type="checkbox" name="enableLiveSearch" value="true"${liveSearchChecked} />
                              Include Live TV in global search
                          </label>
+                         ${catalogsHtml}
                      </div>
                      <button type="submit" class="btn full">Save & Install</button>
                 </form>
             </div>
             ${statusHtml}
         </div>
+        <script>
+            function catFilter(input, listId) {
+                const q = input.value.trim().toLowerCase();
+                for (const el of document.getElementById(listId).children) {
+                    el.style.display = (!q || el.textContent.toLowerCase().includes(q)) ? '' : 'none';
+                }
+            }
+            function catAll(listId, checked) {
+                for (const el of document.getElementById(listId).children) {
+                    if (el.style.display !== 'none') el.querySelector('input').checked = checked;
+                }
+            }
+        </script>
     </body></html>`;
 }
 
-app.get('/configure', (req, res) => {
+app.get('/configure', async (req, res) => {
     const existing = decodeConfig(req.query.config) || {};
+    const serverUrl = req.query.serverUrl || existing.serverUrl || '';
+    const username = req.query.username || existing.username || '';
+    const password = req.query.password || existing.password || '';
+    const categories = (existing.serverUrl && existing.username && existing.password)
+        ? await loadSelectableCategories(existing)
+        : null;
     res.send(renderConfigPage({
-        serverUrl: req.query.serverUrl || existing.serverUrl || '',
-        username: req.query.username || existing.username || '',
-        password: req.query.password || existing.password || '',
+        serverUrl,
+        username,
+        password,
         settings: getSettings(existing),
+        categories,
         baseUrl: getBaseUrl(req)
     }));
 });
@@ -1121,12 +1271,16 @@ app.post('/configure', async (req, res) => {
         const finalServerUrl = validation.valid
             ? (validation.resolvedUrl || normalizeUrl(rawServerUrl))
             : rawServerUrl;
+        const categories = validation.valid
+            ? await loadSelectableCategories({ serverUrl: finalServerUrl, username, password })
+            : null;
 
         res.send(renderConfigPage({
             serverUrl: finalServerUrl,
             username,
             password,
             settings,
+            categories,
             status: validation,
             baseUrl: getBaseUrl(req)
         }));
@@ -1142,14 +1296,16 @@ app.post('/configure', async (req, res) => {
     }
 });
 
-app.get('/:config/configure', (req, res) => {
+app.get('/:config/configure', async (req, res) => {
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.redirect('/configure');
+    const categories = await loadSelectableCategories(cfg);
     res.send(renderConfigPage({
         serverUrl: cfg.serverUrl || '',
         username: cfg.username || '',
         password: cfg.password || '',
         settings: getSettings(cfg),
+        categories,
         baseUrl: getBaseUrl(req)
     }));
 });
@@ -1165,11 +1321,15 @@ app.post('/:config/configure', async (req, res) => {
         const finalServerUrl = validation.valid
             ? (validation.resolvedUrl || normalizeUrl(rawServerUrl))
             : rawServerUrl;
+        const categories = validation.valid
+            ? await loadSelectableCategories({ serverUrl: finalServerUrl, username, password })
+            : null;
         res.send(renderConfigPage({
             serverUrl: finalServerUrl,
             username,
             password,
             settings,
+            categories,
             status: validation,
             baseUrl: getBaseUrl(req)
         }));
@@ -1287,6 +1447,55 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
                 posterShape: 'poster'
             }));
 
+            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
+        }
+
+        // User-picked category catalogs (one catalog per selected category)
+        if (id.startsWith('xtremio_pick_')) {
+            const match = /^xtremio_pick_([msl])_(.+)$/.exec(id);
+            if (!match) return res.json({ metas: [] });
+            const kindCode = match[1];
+            const categoryId = match[2];
+            const kind = kindCode === 'm' ? 'movie' : kindCode === 's' ? 'series' : 'live';
+
+            let items = await getCategoryStreams(cfg, kind, categoryId);
+
+            // Resolve the category name (cached) so providers that omit
+            // category fields in scoped responses still filter correctly.
+            const cats = await getCategories(cfg);
+            const source = kind === 'movie' ? cats.movies : kind === 'series' ? cats.series : cats.live;
+            const cat = source.find(c => String(c.category_id == null ? '' : c.category_id) === categoryId);
+            items = filterCategoryItems(items, categoryId, cat && cat.category_name);
+
+            if (extra.search) {
+                items = filterBySearch(items, extra.search);
+            }
+
+            const page = items.slice(skip, skip + PAGE_SIZE);
+            const metas = page.map(s => (kind === 'live'
+                ? {
+                    id: `xtremio_live_${s.stream_id}`,
+                    type: settings.liveCategoryName,
+                    name: s.name,
+                    poster: s.stream_icon || undefined,
+                    posterShape: 'square'
+                }
+                : kind === 'movie'
+                    ? {
+                        id: `xtremio_movie_${s.stream_id}`,
+                        type: settings.moviesCategoryName,
+                        name: s.name,
+                        poster: s.stream_icon || undefined,
+                        posterShape: 'poster'
+                    }
+                    : {
+                        id: `xtremio_series_${s.series_id}`,
+                        type: 'series',
+                        name: s.name,
+                        poster: s.cover || undefined,
+                        posterShape: 'poster'
+                    }
+            ));
             return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
         }
 

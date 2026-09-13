@@ -25,7 +25,7 @@ Optimized self-hosted Stremio addon for Xtream Codes.
 - Lightweight Node 22 Alpine container.
 - Non-root, read-only container with dropped capabilities.
 - Defensive category filtering when providers return mixed or incomplete category data.
-- Optional addon name, category labels, and a Live TV search toggle.
+- Optional addon name, category labels, a Live TV search toggle, and pickable home catalogs (one catalog per selected provider category).
 
 ## Run
 
@@ -79,11 +79,17 @@ Open `/configure` and set the options directly in the web form:
 - Movies category name
 - Series category name
 - Include or exclude Live TV from global search
+- Pick provider categories to expose as separate home catalogs
+
+After a successful connection check the page loads the provider's movie,
+series, and live categories (filterable, with All/None per section). Every
+picked category becomes its own catalog you can pin and reorder on the
+Stremio / Nuvio board.
 
 These settings are stored in the generated Stremio install URL, so different
-users can choose different names. The internal IDs and the original catalog
-structure remain unchanged. Live TV search is off by default and adds only a
-search entry when enabled.
+users can choose different names and different picked categories. The
+internal IDs and the original catalog structure remain unchanged. Live TV
+search is off by default and adds only a search entry when enabled.
 
 The caches use stale-while-revalidate. Complete responses can be served stale while
 one background refresh runs; incomplete category and metadata responses are not retained.
